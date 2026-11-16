@@ -106,6 +106,7 @@ struct HttpRouteRequest {
     std::map<std::string, std::string> headers; // lowercased header names
     std::string body;
     std::string remoteAddr;
+    bool unixSocket{false}; // Arrived on the Unix socket listener (local principal, no OAuth)
 
     std::optional<std::string> header(std::string_view name) const {
         auto it = headers.find(serve_detail::ascii_lower(name));

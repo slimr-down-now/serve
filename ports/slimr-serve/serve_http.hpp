@@ -153,10 +153,10 @@ inline std::map<std::string, std::string> parse_query_params(std::string_view ra
 
 } // namespace serve_detail
 
-/** Configuration options for ServeHttpServer. */
+/** Configuration options for ServeHttpServer; TCP and the Unix socket are each opt-in. */
 struct ServeHttpOptions {
     std::string host{"0.0.0.0"};
-    int port{0};
+    std::optional<int> port; // TCP listener when set; 0 binds an ephemeral port
     std::string publicBaseUrl;
     size_t maxRequestBytes{size_t{4} * 1024 * 1024};
     uint32_t maxConnections{64};
@@ -165,11 +165,14 @@ struct ServeHttpOptions {
     int keepaliveTimeoutMs{30000};
     OAuthResourceConfig oauth;
     std::vector<CustomHttpRoute> customRoutes;
+    std::string socketPath; // Unix socket listener when set
+    mode_t socketMode{0600};
+    std::string socketGroup;
 };
 
 using HttpServerOptions = ServeHttpOptions;
 
-/** Plain JSON + NDJSON HTTP server for ServeApp using cpp-httplib and D13 graceful drain. */
+/** Plain JSON + NDJSON server for ServeApp on DaemonServer listeners (TCP and/or Unix socket) with D13 graceful drain. */
 class ServeHttpServer {
   public:
     explicit ServeHttpServer(ServeApp &app, ServeHttpOptions opts = {})
@@ -205,119 +208,11 @@ class ServeHttpServer {
         if (running_.load(std::memory_order_acquire))
             return true;
 
-        bool isV6 = false;
-        if (!serve_detail::is_valid_ip_literal(opts_.host, &isV6)) {
+        if (opts_.port && !serve_detail::is_valid_ip_literal(opts_.host)) {
             if (errOut)
                 *errOut = "Invalid bind host IP literal: " + opts_.host;
             return false;
         }
-        if (opts_.port < 0 || opts_.port > 65535) {
-            if (errOut)
-                *errOut = "Invalid port: " + std::to_string(opts_.port);
-            return false;
-        }
-
-        svr_ = std::make_unique<httplib::Server>();
-        const size_t baseThreads = std::max<size_t>(8, opts_.workerThreads);
-        const size_t maxThreads = std::max<size_t>(baseThreads, static_cast<size_t>(opts_.maxConnections) + 16);
-        svr_->new_task_queue = [baseThreads, maxThreads]() {
-            return new httplib::ThreadPool(baseThreads, maxThreads, 0);
-        };
-        svr_->set_payload_max_length(opts_.maxRequestBytes);
-        svr_->set_keep_alive_timeout(std::max<time_t>(1, (opts_.keepaliveTimeoutMs + 999) / 1000));
-        svr_->set_write_timeout(1, 0);
-
-        // Reject draining requests and oversized Content-Length before reading bodies.
-        svr_->set_pre_routing_handler([this](const httplib::Request &req, httplib::Response &res) {
-            if (draining_.load(std::memory_order_acquire)) {
-                res.set_header("Connection", "close");
-                res.status = 503;
-                res.set_content("{\"error\":\"server_stopping\"}", "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            if (req.has_header("Content-Length")) {
-                std::string cl = req.get_header_value("Content-Length");
-                char *endPtr = nullptr;
-                unsigned long long len = std::strtoull(cl.c_str(), &endPtr, 10);
-                if (endPtr == cl.c_str() || *endPtr != '\0' || len > opts_.maxRequestBytes) {
-                    res.status = 413;
-                    res.set_content("{\"error\":\"payload_too_large\"}", "application/json");
-                    return httplib::Server::HandlerResponse::Handled;
-                }
-            }
-            return httplib::Server::HandlerResponse::Unhandled;
-        });
-
-        // Register custom routes BEFORE generic /:tool (httplib uses first-match-wins).
-        for (const auto &route : opts_.customRoutes) {
-            registerCustomRoute(route);
-        }
-
-        auto methodNotAllowedGet = [](const httplib::Request &, httplib::Response &res) {
-            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
-                         {{"Allow", "GET"}});
-        };
-        svr_->Get("/health", [this](const httplib::Request &, httplib::Response &res) {
-            Json body = json_obj();
-            body["status"] = "ok";
-            body["key"] = app_.key;
-            body["version"] = app_.version;
-            body["apiVersion"] = app_.apiVersion;
-            sendJsonText(res, 200, slimr::write_json(body));
-        });
-        svr_->Post("/health", methodNotAllowedGet);
-        svr_->Put("/health", methodNotAllowedGet);
-        svr_->Delete("/health", methodNotAllowedGet);
-        svr_->Patch("/health", methodNotAllowedGet);
-
-        svr_->Get("/schema", [this](const httplib::Request &, httplib::Response &res) {
-            Json toolsObj = json_obj();
-            for (const auto &[tName, def] : app_.tools()) {
-                Json entry = json_obj();
-                entry["name"] = def.name;
-                entry["description"] = def.description;
-                entry["inputSchema"] = def.inputSchema;
-                if (def.outputSchema.has_value())
-                    entry["outputSchema"] = *def.outputSchema;
-                Json ann = def.annotations.toJson();
-                if (!ann.empty())
-                    entry["annotations"] = std::move(ann);
-                entry["runsLocal"] = def.runsLocal;
-                entry["threadSafe"] = def.threadSafe;
-                toolsObj[tName] = std::move(entry);
-            }
-            Json body = json_obj();
-            body["name"] = app_.key;
-            body["version"] = app_.version;
-            body["apiVersion"] = app_.apiVersion;
-            body["tools"] = std::move(toolsObj);
-            sendJsonText(res, 200, slimr::write_json(body));
-        });
-        svr_->Post("/schema", methodNotAllowedGet);
-        svr_->Put("/schema", methodNotAllowedGet);
-        svr_->Delete("/schema", methodNotAllowedGet);
-        svr_->Patch("/schema", methodNotAllowedGet);
-
-        svr_->Post("/:tool", [this](const httplib::Request &req, httplib::Response &res) {
-            try {
-                handleToolPost(req, res);
-            } catch (const std::exception &e) {
-                Json err = json_obj();
-                err["error"] = "internal_error";
-                err["message"] = redact_sensitive(e.what());
-                sendJsonText(res, 500, slimr::write_json(err));
-            } catch (...) {
-                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
-            }
-        });
-        auto methodNotAllowedPost = [](const httplib::Request &, httplib::Response &res) {
-            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
-                         {{"Allow", "POST"}});
-        };
-        svr_->Get("/:tool", methodNotAllowedPost);
-        svr_->Put("/:tool", methodNotAllowedPost);
-        svr_->Delete("/:tool", methodNotAllowedPost);
-        svr_->Patch("/:tool", methodNotAllowedPost);
 
         draining_.store(false, std::memory_order_release);
         {
@@ -327,41 +222,70 @@ class ServeHttpServer {
             drain_->activeCancels.clear();
         }
 
-        int actualPort = -1;
-        if (opts_.port == 0) {
-            actualPort = svr_->bind_to_any_port(opts_.host);
-        } else if (svr_->bind_to_port(opts_.host, opts_.port)) {
-            actualPort = opts_.port;
-        }
-        if (actualPort <= 0) {
-            svr_.reset();
+        DaemonListenOptions listen;
+        listen.host = opts_.host;
+        listen.port = opts_.port;
+        listen.socketPath = opts_.socketPath;
+        listen.socketMode = opts_.socketMode;
+        listen.socketGroup = opts_.socketGroup;
+        listen.maxConnections = opts_.maxConnections;
+        listen.minWorkerThreads = opts_.workerThreads;
+        listen.keepaliveTimeoutSec = std::max(1, (opts_.keepaliveTimeoutMs + 999) / 1000);
+        listen.shutdownTimeoutMs = opts_.shutdownTimeoutMs;
+        daemon_ = std::make_unique<DaemonServer>(
+            app_,
+            std::move(listen),
+            [this](httplib::Server &svr, DisconnectWatcher &watcher, bool isUnixSocket) {
+                configureRoutes(svr, watcher, isUnixSocket);
+            },
+            [this]() { drain(); });
+
+        std::string err;
+        if (!daemon_->start(&err)) {
+            daemon_.reset();
             if (errOut)
-                *errOut = "Failed to bind HTTP server on " + opts_.host + ":" + std::to_string(opts_.port);
+                *errOut = std::move(err);
             return false;
         }
 
-        acceptThread_ = std::thread([this]() { svr_->listen_after_bind(); });
-        svr_->wait_until_ready();
-        if (!svr_->is_running()) {
-            svr_->stop();
-            if (acceptThread_.joinable())
-                acceptThread_.join();
-            svr_.reset();
-            if (errOut)
-                *errOut = "Failed to start HTTP server on " + opts_.host + ":" + std::to_string(actualPort);
-            return false;
-        }
-
-        boundPort_.store(static_cast<uint16_t>(actualPort), std::memory_order_release);
+        boundPort_.store(static_cast<uint16_t>(daemon_->boundTcpPort()), std::memory_order_release);
         running_.store(true, std::memory_order_release);
         return true;
     }
 
     void stop() {
-        bool wasRunning = running_.exchange(false, std::memory_order_acq_rel);
-        if (!wasRunning)
+        if (!running_.exchange(false, std::memory_order_acq_rel))
             return;
+        daemon_->stop();
+        boundPort_.store(0, std::memory_order_release);
+    }
 
+    /** Serves until SIGINT/SIGTERM or an onServe failure; returns 1 when onServe failed. */
+    int runUntilSignal() {
+        int rc = daemon_ ? daemon_->runUntilSignal() : 1;
+        stop();
+        return rc;
+    }
+
+  private:
+    struct DrainState {
+        std::mutex mu;
+        std::condition_variable idleCv;
+        std::condition_variable responsesCv;
+        std::vector<std::weak_ptr<CancellationSource>> activeCancels;
+        size_t activeCount{0};
+        size_t inFlightResponses{0};
+    };
+
+    struct NdjsonStreamState {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool finished{false};
+    };
+
+    // Reject new requests, wait for in-flight calls and responses, then cancel stragglers.
+    void drain() {
         draining_.store(true, std::memory_order_release);
 
         auto deadline = std::chrono::steady_clock::now() +
@@ -384,55 +308,103 @@ class ServeHttpServer {
                 return drain_->inFlightResponses == 0;
             });
         }
-
-        if (svr_)
-            svr_->stop();
-        if (acceptThread_.joinable())
-            acceptThread_.join();
-        svr_.reset();
-        boundPort_.store(0, std::memory_order_release);
     }
 
-    int runUntilSignal() {
-        static std::atomic<bool> *sStopFlag = nullptr;
-        std::atomic<bool> stopRequested{false};
-        sStopFlag = &stopRequested;
+    void configureRoutes(httplib::Server &svr, DisconnectWatcher &watcher, bool isUnixSocket) {
+        svr.set_payload_max_length(opts_.maxRequestBytes);
 
-        auto sigHandler = [](int) {
-            if (sStopFlag)
-                sStopFlag->store(true, std::memory_order_release);
-        };
-        auto prevInt = std::signal(SIGINT, sigHandler);
-        auto prevTerm = std::signal(SIGTERM, sigHandler);
+        // Reject draining requests and oversized Content-Length before reading bodies.
+        svr.set_pre_routing_handler([this](const httplib::Request &req, httplib::Response &res) {
+            if (draining_.load(std::memory_order_acquire)) {
+                res.set_header("Connection", "close");
+                res.status = 503;
+                res.set_content("{\"error\":\"server_stopping\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            if (req.has_header("Content-Length")) {
+                std::string cl = req.get_header_value("Content-Length");
+                char *endPtr = nullptr;
+                unsigned long long len = std::strtoull(cl.c_str(), &endPtr, 10);
+                if (endPtr == cl.c_str() || *endPtr != '\0' || len > opts_.maxRequestBytes) {
+                    res.status = 413;
+                    res.set_content("{\"error\":\"payload_too_large\"}", "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
 
-        while (running_.load(std::memory_order_acquire) &&
-               !stopRequested.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Register custom routes BEFORE generic /:tool (httplib uses first-match-wins).
+        for (const auto &route : opts_.customRoutes) {
+            registerCustomRoute(svr, route, isUnixSocket);
         }
 
-        std::signal(SIGINT, prevInt);
-        std::signal(SIGTERM, prevTerm);
-        sStopFlag = nullptr;
-        stop();
-        return 0;
+        auto methodNotAllowedGet = [](const httplib::Request &, httplib::Response &res) {
+            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
+                         {{"Allow", "GET"}});
+        };
+        svr.Get("/health", [this](const httplib::Request &, httplib::Response &res) {
+            Json body = json_obj();
+            body["status"] = "ok";
+            body["key"] = app_.key;
+            body["version"] = app_.version;
+            body["apiVersion"] = app_.apiVersion;
+            sendJsonText(res, 200, slimr::write_json(body));
+        });
+        svr.Post("/health", methodNotAllowedGet);
+        svr.Put("/health", methodNotAllowedGet);
+        svr.Delete("/health", methodNotAllowedGet);
+        svr.Patch("/health", methodNotAllowedGet);
+
+        svr.Get("/schema", [this](const httplib::Request &, httplib::Response &res) {
+            Json toolsObj = json_obj();
+            for (const auto &[tName, def] : app_.tools()) {
+                Json entry = json_obj();
+                entry["name"] = def.name;
+                entry["description"] = def.description;
+                entry["inputSchema"] = def.inputSchema;
+                if (def.outputSchema.has_value())
+                    entry["outputSchema"] = *def.outputSchema;
+                Json ann = def.annotations.toJson();
+                if (!ann.empty())
+                    entry["annotations"] = std::move(ann);
+                entry["runsLocal"] = def.runsLocal;
+                entry["threadSafe"] = def.threadSafe;
+                toolsObj[tName] = std::move(entry);
+            }
+            Json body = json_obj();
+            body["name"] = app_.key;
+            body["version"] = app_.version;
+            body["apiVersion"] = app_.apiVersion;
+            body["tools"] = std::move(toolsObj);
+            sendJsonText(res, 200, slimr::write_json(body));
+        });
+        svr.Post("/schema", methodNotAllowedGet);
+        svr.Put("/schema", methodNotAllowedGet);
+        svr.Delete("/schema", methodNotAllowedGet);
+        svr.Patch("/schema", methodNotAllowedGet);
+
+        svr.Post("/:tool", [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
+            try {
+                handleToolPost(req, res, watcher, isUnixSocket);
+            } catch (const std::exception &e) {
+                Json err = json_obj();
+                err["error"] = "internal_error";
+                err["message"] = redact_sensitive(e.what());
+                sendJsonText(res, 500, slimr::write_json(err));
+            } catch (...) {
+                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
+            }
+        });
+        auto methodNotAllowedPost = [](const httplib::Request &, httplib::Response &res) {
+            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
+                         {{"Allow", "POST"}});
+        };
+        svr.Get("/:tool", methodNotAllowedPost);
+        svr.Put("/:tool", methodNotAllowedPost);
+        svr.Delete("/:tool", methodNotAllowedPost);
+        svr.Patch("/:tool", methodNotAllowedPost);
     }
-
-  private:
-    struct DrainState {
-        std::mutex mu;
-        std::condition_variable idleCv;
-        std::condition_variable responsesCv;
-        std::vector<std::weak_ptr<CancellationSource>> activeCancels;
-        size_t activeCount{0};
-        size_t inFlightResponses{0};
-    };
-
-    struct NdjsonStreamState {
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<std::string> lines;
-        bool finished{false};
-    };
 
     static void sendResponse(httplib::Response &res,
                              int status,
@@ -453,7 +425,7 @@ class ServeHttpServer {
         sendResponse(res, status, "application/json", jsonStr, std::move(extraHeaders));
     }
 
-    static HttpRouteRequest toRouteRequest(const httplib::Request &req) {
+    static HttpRouteRequest toRouteRequest(const httplib::Request &req, bool isUnixSocket) {
         HttpRouteRequest out;
         out.method = req.method;
         out.path = req.path;
@@ -464,20 +436,21 @@ class ServeHttpServer {
         }
         out.body = req.body;
         out.remoteAddr = req.remote_addr + ":" + std::to_string(req.remote_port);
+        out.unixSocket = isUnixSocket;
         return out;
     }
 
-    void registerCustomRoute(const CustomHttpRoute &route) {
+    void registerCustomRoute(httplib::Server &svr, const CustomHttpRoute &route, bool isUnixSocket) {
         if (!route.handler || route.path.empty())
             return;
         auto routePtr = std::make_shared<CustomHttpRoute>(route);
-        auto wrap = [this, routePtr](const httplib::Request &req, httplib::Response &res) {
+        auto wrap = [this, routePtr, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
             try {
                 if (req.body.size() > opts_.maxRequestBytes) {
                     sendJsonText(res, 413, "{\"error\":\"payload_too_large\"}");
                     return;
                 }
-                HttpRouteRequest rreq = toRouteRequest(req);
+                HttpRouteRequest rreq = toRouteRequest(req, isUnixSocket);
                 HttpRouteResponse rresp = routePtr->handler(rreq);
                 std::vector<std::pair<std::string, std::string>> hdrs;
                 hdrs.reserve(rresp.headers.size());
@@ -497,24 +470,24 @@ class ServeHttpServer {
 
         std::string m = serve_detail::ascii_lower(route.method);
         if (m == "get")
-            svr_->Get(route.path, wrap);
+            svr.Get(route.path, wrap);
         else if (m == "post")
-            svr_->Post(route.path, wrap);
+            svr.Post(route.path, wrap);
         else if (m == "delete")
-            svr_->Delete(route.path, wrap);
+            svr.Delete(route.path, wrap);
         else if (m == "put")
-            svr_->Put(route.path, wrap);
+            svr.Put(route.path, wrap);
         else if (m == "patch")
-            svr_->Patch(route.path, wrap);
+            svr.Patch(route.path, wrap);
         else if (m == "options")
-            svr_->Options(route.path, wrap);
+            svr.Options(route.path, wrap);
         else if (m == "*") {
-            svr_->Get(route.path, wrap);
-            svr_->Post(route.path, wrap);
-            svr_->Delete(route.path, wrap);
-            svr_->Put(route.path, wrap);
-            svr_->Patch(route.path, wrap);
-            svr_->Options(route.path, wrap);
+            svr.Get(route.path, wrap);
+            svr.Post(route.path, wrap);
+            svr.Delete(route.path, wrap);
+            svr.Put(route.path, wrap);
+            svr.Patch(route.path, wrap);
+            svr.Options(route.path, wrap);
         }
     }
 
@@ -540,7 +513,10 @@ class ServeHttpServer {
         sendJsonText(res, 403, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
     }
 
-    void handleToolPost(const httplib::Request &req, httplib::Response &res) {
+    void handleToolPost(const httplib::Request &req,
+                        httplib::Response &res,
+                        DisconnectWatcher &watcher,
+                        bool isUnixSocket) {
         if (req.body.size() > opts_.maxRequestBytes) {
             sendJsonText(res, 413, "{\"error\":\"payload_too_large\"}");
             return;
@@ -586,9 +562,11 @@ class ServeHttpServer {
             return;
         }
 
-        HttpRouteRequest routeReq = toRouteRequest(req);
+        HttpRouteRequest routeReq = toRouteRequest(req, isUnixSocket);
         Principal principal;
-        if (opts_.oauth.enabled) {
+        if (isUnixSocket) {
+            principal = local_principal(app_);
+        } else if (opts_.oauth.enabled) {
             auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, baseUrl(), routeReq);
             if (authRes.status == TokenValidationResult::Status::InvalidToken) {
                 sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription);
@@ -607,7 +585,7 @@ class ServeHttpServer {
 
         std::span<const std::string> toolScopeSpan(def->requiredScopes.data(), def->requiredScopes.size());
         if (auto authErr = checkAuthorization(app_, principal, toolScopeSpan, def->name)) {
-            if (opts_.oauth.enabled && authErr->code == ServeErrorCode::InsufficientScope) {
+            if (opts_.oauth.enabled && !isUnixSocket && authErr->code == ServeErrorCode::InsufficientScope) {
                 sendOAuthInsufficientScope(res, authErr->requiredScopes, authErr->message);
             } else {
                 Json body = json_obj();
@@ -697,6 +675,7 @@ class ServeHttpServer {
         };
 
         if (!wantNdjson) {
+            auto disconnectWatch = watcher.watch(req, cancelSrc);
             ServeResult toolRes;
             try {
                 if (app_.concurrency == ConcurrencyPolicy::Serialized && !def->threadSafe) {
@@ -849,49 +828,70 @@ class ServeHttpServer {
     ServeApp &app_;
     ServeHttpOptions opts_;
     std::shared_ptr<DrainState> drain_;
-    std::unique_ptr<httplib::Server> svr_;
-    std::thread acceptThread_;
+    std::unique_ptr<DaemonServer> daemon_;
     std::atomic<bool> running_{false};
     std::atomic<bool> draining_{false};
     std::atomic<uint16_t> boundPort_{0};
 };
 
-/** Attaches standalone `serve [--host <addr>] [--port <n>]` (and `http` alias) subcommand and CLI remote relay to ServeApp. */
+/** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags and CLI remote relay to ServeApp. */
 inline void enable_serve(ServeApp &app, ServeHttpOptions defaults = {}) {
     enable_cli_relay(app);
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &target, int argc, char **argv) -> int {
         ServeHttpOptions opts = defaults;
+        std::string prog = target.key.empty() ? "app" : target.key;
         std::string subcmd = argc >= 2 ? std::string(argv[1]) : "serve";
+        auto usage = [&](const std::string &msg) {
+            std::cerr << msg << "\n"
+                      << "Usage: " << prog << " " << subcmd
+                      << " [--host <addr>] [--port <n>] [--socket <path>] [--socket-mode <octal>] [--socket-group <name>]\n";
+            return 2;
+        };
         for (int i = 2; i < argc; ++i) {
-            std::string_view arg = argv[i];
-            if (arg == "--host" && i + 1 < argc) {
-                opts.host = argv[++i];
-            } else if (arg == "--port" && i + 1 < argc) {
-                std::string portStr = argv[++i];
-                char *endPtr = nullptr;
-                long parsedPort = std::strtol(portStr.c_str(), &endPtr, 10);
-                if (endPtr == portStr.c_str() || *endPtr != '\0' || parsedPort < 0 || parsedPort > 65535) {
-                    std::cerr << "Invalid --port value: " << portStr << "\n";
-                    return 2;
-                }
+            std::string arg = argv[i];
+            bool known = arg == "--host" || arg == "--port" || arg == "--socket" || arg == "--socket-mode" ||
+                         arg == "--socket-group";
+            if (!known || i + 1 >= argc)
+                return usage("Unknown or incomplete option: " + arg);
+            std::string val = argv[++i];
+            char *endPtr = nullptr;
+            if (arg == "--host") {
+                if (!serve_detail::is_valid_ip_literal(val))
+                    return usage("Invalid --host value (IP literal required): " + val);
+                opts.host = val;
+            } else if (arg == "--port") {
+                long parsedPort = std::strtol(val.c_str(), &endPtr, 10);
+                if (endPtr == val.c_str() || *endPtr != '\0' || parsedPort < 0 || parsedPort > 65535)
+                    return usage("Invalid --port value: " + val);
                 opts.port = static_cast<int>(parsedPort);
+            } else if (arg == "--socket") {
+                std::string pathErr;
+                if (!serve_daemon_detail::validate_sun_path(val, pathErr))
+                    return usage("Invalid --socket value: " + pathErr);
+                opts.socketPath = val;
+            } else if (arg == "--socket-mode") {
+                long mode = std::strtol(val.c_str(), &endPtr, 8);
+                if (endPtr == val.c_str() || *endPtr != '\0' || mode < 0 || mode > 0777)
+                    return usage("Invalid --socket-mode value (octal 0-777): " + val);
+                opts.socketMode = static_cast<mode_t>(mode);
             } else {
-                std::cerr << "Unknown or incomplete option: " << arg << "\n";
-                std::cerr << "Usage: " << (target.key.empty() ? "app" : target.key)
-                          << " " << subcmd << " [--host <addr>] [--port <n>]\n";
-                return 2;
+                if (val.empty())
+                    return usage("Invalid --socket-group value: empty name");
+                opts.socketGroup = val;
             }
         }
 
-        ServeHttpServer server(target, std::move(opts));
+        ServeHttpServer server(target, opts);
         std::string errMsg;
         if (!server.start(&errMsg)) {
-            std::cerr << "HTTP server failed to start: " << errMsg << "\n";
+            std::cerr << prog << " failed to start: " << errMsg << "\n";
             return 1;
         }
-        std::cerr << (target.key.empty() ? "app" : target.key)
-                  << " listening on " << server.baseUrl() << "\n"
-                  << std::flush;
+        if (opts.port)
+            std::cerr << prog << " listening on " << server.baseUrl() << "\n";
+        if (!opts.socketPath.empty())
+            std::cerr << prog << " listening on unix:" << opts.socketPath << "\n";
+        std::cerr << std::flush;
         return server.runUntilSignal();
     });
 }

@@ -201,8 +201,7 @@ inline void print_cli_help(const ServeApp &app, std::ostream &os = std::cout) {
     std::string prog = app.key.empty() ? "app" : app.key;
     os << "Usage:\n";
     if (app.hasHttpRunner()) {
-        os << "  " << prog << " [--skip-checks] serve [--host <addr>] [--port <n>] [--socket <path>] [--socket-mode <octal>] [--socket-group <name>]\n";
-        os << "  " << prog << " [--skip-checks] http [--host <addr>] [--port <n>]\n";
+        os << "  " << prog << " [--skip-checks] serve|http [--host <addr>] [--port <n>] [--socket <path>] [--socket-mode <octal>] [--socket-group <name>]\n";
     }
     if (app.allowCliTools) {
         os << "  " << prog << " [--skip-checks] [--remote <target>] <tool> ['{\"arg\":\"val\"}'|@path|-]\n";

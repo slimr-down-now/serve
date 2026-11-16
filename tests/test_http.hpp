@@ -3,11 +3,14 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <filesystem>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -47,6 +50,56 @@ inline bool can_connect_loopback(uint16_t port) {
     int rc = ::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
     ::close(fd);
     return rc == 0;
+}
+
+inline int run_serve(slimr::ServeApp &app, std::vector<std::string> args) {
+    std::vector<char *> argv;
+    for (auto &a : args)
+        argv.push_back(a.data());
+    return app.httpRunner()(app, static_cast<int>(argv.size()), argv.data());
+}
+
+// Runs the serve runner on a thread; stop() raises SIGTERM once the runner's handler is installed.
+struct ServeRunner {
+    std::atomic<int> rc{-1};
+    std::thread th;
+
+    ServeRunner(slimr::ServeApp &app, std::vector<std::string> args)
+        : th([this, &app, args = std::move(args)]() mutable { rc.store(run_serve(app, std::move(args))); }) {}
+    ServeRunner(const ServeRunner &) = delete;
+    ServeRunner &operator=(const ServeRunner &) = delete;
+    ~ServeRunner() { stop(); }
+
+    int stop() {
+        for (int i = 0; i < 300 && th.joinable() && rc.load() == -1; ++i) {
+            struct sigaction sa{};
+            ::sigaction(SIGTERM, nullptr, &sa);
+            if (sa.sa_handler != SIG_DFL) {
+                std::raise(SIGTERM);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (th.joinable())
+            th.join();
+        return rc.load();
+    }
+};
+
+inline httplib::Client unix_client(const std::string &sockPath) {
+    httplib::Client cli(sockPath);
+    cli.set_address_family(AF_UNIX);
+    return cli;
+}
+
+inline bool wait_for_health(httplib::Client &cli) {
+    for (int i = 0; i < 300; ++i) {
+        auto res = cli.Get("/health");
+        if (res && res->status == 200)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
 }
 
 } // namespace serve_http_test
@@ -505,4 +558,169 @@ TEST_CASE("[http] enable_serve and enable_http attach runner and validate --port
     slimr::ServeApp app2("s2", "0.1.0");
     slimr::enable_http(app2);
     CHECK(app2.hasHttpRunner());
+}
+
+TEST_CASE("[http] serve --socket serves POST /<tool>, relays from the CLI, and holds a single-instance lock") {
+    serve_daemon_server_test::TempDirGuard tmp("ss");
+    auto sockPath = (tmp.dir / "serve.sock").string();
+
+    slimr::ServeApp app("sock-serve", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+    slimr::enable_serve(app);
+
+    serve_http_test::ServeRunner runner(app, {"sock-serve", "serve", "--socket", sockPath, "--socket-mode", "0660"});
+    auto cli = serve_http_test::unix_client(sockPath);
+    REQUIRE(serve_http_test::wait_for_health(cli));
+
+    struct stat st{};
+    REQUIRE(::stat(sockPath.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0660);
+
+    auto res = cli.Post("/add", R"({"a":2,"b":3})", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = slimr::parse_json<slimr::Json>(res->body);
+    REQUIRE(j.has_value());
+    CHECK((*j)["sum"].get<int64_t>() == 5);
+
+    const auto *def = app.findTool("add");
+    REQUIRE(def != nullptr);
+    std::string remote = "unix:" + sockPath;
+    char prog[] = "sock-serve";
+    char rFlag[] = "--remote";
+    char toolArg[] = "add";
+    char *argv[] = {prog, rFlag, remote.data(), toolArg};
+    slimr::Json args = slimr::json_obj();
+    args["a"] = 4;
+    args["b"] = 6;
+    slimr::RequestContext ctx;
+    std::ostringstream out;
+    std::ostringstream err;
+    CHECK(slimr::run_cli_relay(app, *def, args, ctx, 4, argv, out, err) == 0);
+    CHECK(out.str().find("\"sum\":10") != std::string::npos);
+
+    CHECK(serve_http_test::run_serve(app, {"sock-serve", "serve", "--socket", sockPath}) == 1);
+
+    CHECK(runner.stop() == 0);
+    CHECK_FALSE(std::filesystem::exists(sockPath));
+}
+
+TEST_CASE("[http] TCP and Unix socket answer the same routes; the socket uses the local principal") {
+    serve_daemon_server_test::TempDirGuard tmp("du");
+    auto sockPath = (tmp.dir / "dual.sock").string();
+
+    slimr::ServeApp app("dual", "0.1.0");
+    app.tool<serve_http_test::AddIn>(
+        "add",
+        "Add",
+        slimr::ToolOptions{.requiredScopes = {"calc:write"}},
+        [](const serve_http_test::AddIn &in) {
+            return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+        });
+
+    slimr::ServeHttpOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.socketPath = sockPath;
+    opts.oauth.enabled = true;
+    opts.oauth.validateToken = [](const slimr::TokenValidationContext &ctx) {
+        slimr::TokenValidationResult r;
+        if (ctx.token == "good") {
+            r.status = slimr::TokenValidationResult::Status::Valid;
+            r.principal.authenticated = true;
+            r.principal.audience = std::string(ctx.expectedResource);
+            r.principal.scopes = {"calc:write"};
+        }
+        return r;
+    };
+    opts.customRoutes.push_back(slimr::CustomHttpRoute{
+        .method = "GET",
+        .path = "/transport",
+        .handler = [](const slimr::HttpRouteRequest &req) {
+            return slimr::HttpRouteResponse::html(200, req.unixSocket ? "unix" : "tcp");
+        },
+    });
+
+    slimr::ServeHttpServer srv(app, opts);
+    std::string startErr;
+    REQUIRE(srv.start(&startErr));
+    REQUIRE(srv.boundPort() > 0);
+
+    httplib::Client tcp("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
+    const std::string body = R"({"a":1,"b":2})";
+
+    auto tcpNoAuth = tcp.Post("/add", body, "application/json");
+    REQUIRE(tcpNoAuth);
+    CHECK(tcpNoAuth->status == 401);
+    auto tcpRes = tcp.Post("/add", httplib::Headers{{"Authorization", "Bearer good"}}, body, "application/json");
+    REQUIRE(tcpRes);
+    CHECK(tcpRes->status == 200);
+    auto unixRes = sock.Post("/add", body, "application/json");
+    REQUIRE(unixRes);
+    CHECK(unixRes->status == 200);
+    CHECK(unixRes->body == tcpRes->body);
+
+    auto tcpRoute = tcp.Get("/transport");
+    auto unixRoute = sock.Get("/transport");
+    REQUIRE(tcpRoute);
+    REQUIRE(unixRoute);
+    CHECK(tcpRoute->body == "tcp");
+    CHECK(unixRoute->body == "unix");
+
+    auto unixSchema = sock.Get("/schema");
+    REQUIRE(unixSchema);
+    CHECK(unixSchema->status == 200);
+
+    app.localScopes = {"calc:read"};
+    auto unixDenied = sock.Post("/add", body, "application/json");
+    REQUIRE(unixDenied);
+    CHECK(unixDenied->status == 403);
+    CHECK_FALSE(unixDenied->has_header("WWW-Authenticate"));
+
+    srv.stop();
+    CHECK_FALSE(std::filesystem::exists(sockPath));
+}
+
+TEST_CASE("[http] onServe runs under serve, stops on shutdown, and a failure exits nonzero") {
+    std::atomic<bool> started{false};
+    std::atomic<bool> stopped{false};
+    std::mutex mu;
+    std::condition_variable_any cv;
+
+    slimr::ServeApp app("on-serve", "0.1.0");
+    app.onServe = [&](std::stop_token st) {
+        started.store(true);
+        std::unique_lock lk(mu);
+        cv.wait(lk, st, [&st] { return st.stop_requested(); });
+        stopped.store(true);
+    };
+    slimr::enable_serve(app, {.host = "127.0.0.1", .port = 0});
+
+    serve_http_test::ServeRunner runner(app, {"on-serve", "serve"});
+    for (int i = 0; i < 200 && !started.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(started.load());
+    CHECK_FALSE(stopped.load());
+    CHECK(runner.stop() == 0);
+    CHECK(stopped.load());
+
+    slimr::ServeApp errApp("on-serve-err", "0.1.0");
+    errApp.onServe = [](std::stop_token) { throw std::runtime_error("boom Bearer secret123"); };
+    slimr::enable_serve(errApp, {.host = "127.0.0.1", .port = 0});
+    CHECK(serve_http_test::run_serve(errApp, {"on-serve-err", "serve"}) == 1);
+}
+
+TEST_CASE("[http] serve rejects bad socket flags and requires a listener") {
+    slimr::ServeApp app("flags", "0.1.0");
+    slimr::enable_serve(app);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve", "--socket"}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve", "--socket", std::string(200, 'a')}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve", "--socket-mode", "999"}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve", "--socket-mode", "rw"}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve", "--socket-group", ""}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "http", "--host", "localhost"}) == 2);
+    CHECK(serve_http_test::run_serve(app, {"flags", "serve"}) == 1);
 }

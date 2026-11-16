@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <grp.h>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -356,11 +357,14 @@ class DisconnectWatcher {
 class DaemonServer {
   public:
     using RouteConfiguratorFn = std::function<void(httplib::Server &, DisconnectWatcher &, bool isUnixSocket)>;
+    using DrainFn = std::function<void()>;
 
-    DaemonServer(ServeApp &app, DaemonListenOptions opts, RouteConfiguratorFn configureRoutes)
+    /** drain runs during stop() after onServe stop is requested and before listeners close. */
+    DaemonServer(ServeApp &app, DaemonListenOptions opts, RouteConfiguratorFn configureRoutes, DrainFn drain = {})
         : app_(app),
           opts_(std::move(opts)),
           configureRoutes_(std::move(configureRoutes)),
+          drain_(std::move(drain)),
           watcher_(opts_.cancelPollInterval) {}
 
     DaemonServer(const DaemonServer &) = delete;
@@ -387,6 +391,7 @@ class DaemonServer {
         }
 
         shutdownRequested_.store(false, std::memory_order_release);
+        onServeFailed_.store(false, std::memory_order_release);
         stopping_.store(false, std::memory_order_release);
         watcher_.start();
 
@@ -458,20 +463,21 @@ class DaemonServer {
 
         if (app_.onServe) {
             onServeThread_ = std::jthread([this](std::stop_token st) {
+                std::string safeMsg;
                 try {
                     app_.onServe(std::move(st));
+                    return;
                 } catch (const std::exception &e) {
-                    std::string safeMsg = redact_sensitive(e.what());
-                    if (auto *bs = app_.bugsink()) {
-                        bs->reportError(std::runtime_error(safeMsg));
-                    }
-                    requestShutdown();
+                    safeMsg = redact_sensitive(e.what());
                 } catch (...) {
-                    if (auto *bs = app_.bugsink()) {
-                        bs->reportError(std::runtime_error("Unknown exception in onServe"));
-                    }
-                    requestShutdown();
+                    safeMsg = "Unknown exception in onServe";
                 }
+                std::cerr << (app_.key.empty() ? "app" : app_.key) << " onServe failed: " << safeMsg << "\n";
+                if (auto *bs = app_.bugsink()) {
+                    bs->reportError(std::runtime_error(safeMsg));
+                }
+                onServeFailed_.store(true, std::memory_order_release);
+                requestShutdown();
             });
         }
 
@@ -496,7 +502,8 @@ class DaemonServer {
 
     const std::string &socketPath() const noexcept { return opts_.socketPath; }
 
-    void stop() noexcept {
+    // The drain hook must not throw; an escaping exception terminates like any noexcept violation.
+    void stop() noexcept { // NOLINT(bugprone-exception-escape)
         if (stopping_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
@@ -504,6 +511,11 @@ class DaemonServer {
 
         if (onServeThread_.joinable()) {
             onServeThread_.request_stop();
+        }
+        if (drain_) {
+            drain_();
+        }
+        if (onServeThread_.joinable()) {
             onServeThread_.join();
         }
 
@@ -528,6 +540,7 @@ class DaemonServer {
         lockGuard_.release();
     }
 
+    /** Waits for SIGINT/SIGTERM or a shutdown request, then stops; returns 1 when onServe failed. */
     int runUntilSignal() {
         static std::atomic<bool> *sStopFlag = nullptr;
         sStopFlag = &shutdownRequested_;
@@ -549,7 +562,7 @@ class DaemonServer {
         std::signal(SIGTERM, prevTerm);
         sStopFlag = nullptr;
         stop();
-        return 0;
+        return onServeFailed_.load(std::memory_order_acquire) ? 1 : 0;
     }
 
   private:
@@ -569,6 +582,7 @@ class DaemonServer {
     ServeApp &app_;
     DaemonListenOptions opts_;
     RouteConfiguratorFn configureRoutes_;
+    DrainFn drain_;
     DisconnectWatcher watcher_;
     SocketLockGuard lockGuard_;
     std::unique_ptr<httplib::Server> tcpSvr_;
@@ -579,6 +593,7 @@ class DaemonServer {
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> shutdownRequested_{false};
+    std::atomic<bool> onServeFailed_{false};
     std::atomic<int> boundTcpPort_{0};
 };
 

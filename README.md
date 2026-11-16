@@ -51,6 +51,30 @@ int main(int argc, char **argv) {
 }
 ```
 
+### Serving
+
+`calc serve` (alias `calc http`) serves the same routes on every listener: `POST /<tool>` (JSON, or NDJSON progress when `Accept: application/x-ndjson`), `GET /schema`, `GET /health`, plus any `customRoutes` registered first. Each listener is opt-in; with neither configured, `serve` exits 1.
+
+```bash
+calc serve --host 127.0.0.1 --port 0              # TCP; port 0 binds an ephemeral port and logs the URL
+calc serve --socket /path/run/calc.sock           # Unix socket only
+calc serve --port 10001 --socket /path/run/calc.sock --socket-mode 0660 --socket-group staff
+```
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--host <addr>` | `0.0.0.0` | TCP bind address (IP literal) |
+| `--port <n>` | app default | Enables the TCP listener |
+| `--socket <path>` | app default | Enables the Unix socket listener |
+| `--socket-mode <octal>` | `0600` | Socket file mode |
+| `--socket-group <name>` | none | Socket file group (parent dir becomes `0750`, else `0700`) |
+
+Flags override the defaults passed to `enable_serve` (`.host`, `.port`, `.socketPath`, `.socketMode`, `.socketGroup`). TCP evaluates bearer/OAuth when `oauth.enabled`; the socket runs as the local principal (`app.localScopes`) with no OAuth. Both go through the same scope checks and `app.authorizer`. A second `serve` on the same socket exits 1 (`flock` on `<socket>.lock`); a stale socket file is replaced and the socket is unlinked on stop.
+
+`app.onServe` runs on its own thread once the listeners are up. On SIGINT/SIGTERM its `std::stop_token` is signaled before in-flight calls drain, then the thread is joined. An exception escaping `onServe` is reported (redacted, to stderr and Bugsink) and shuts the server down with exit 1.
+
+CLI tool calls relay to a running server with `--remote unix:<path>` or `--remote http://host:port`.
+
 ## Build & Test
 
 ```bash

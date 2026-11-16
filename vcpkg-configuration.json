@@ -1,45 +1,37 @@
 {
   "default-registry": {
     "kind": "builtin",
-    "baseline": "8f363bdc11359ede4bc51e5eb32a2617538049c8"
+    "baseline": "1c6c7f95b0a5d5b6f3a7d687b4a47fd1ca79af78"
   },
   "registries": [
     {
       "kind": "git",
+      "baseline": "284eb1272595ba28ca24ac48bef8645f5f914bd0",
       "repository": "https://github.com/slimr-down-now/test",
-      "baseline": "6b5d99b91c631687aeca740ea0848d471418015c",
       "packages": [
         "slimr-test"
       ]
     },
     {
       "kind": "git",
+      "baseline": "6dd9467ba83cf575a88b7292a06b1abb51778266",
       "repository": "https://github.com/slimr-down-now/json",
-      "baseline": "d21bdc0f61e052053c76b95e57eb230910027006",
       "packages": [
         "slimr-json"
       ]
     },
     {
       "kind": "git",
-      "repository": "https://github.com/slimr-down-now/curl",
-      "baseline": "2e64d6b432cf9af8499c2e773015a3957b22c395",
-      "packages": [
-        "slimr-curl"
-      ]
-    },
-    {
-      "kind": "git",
+      "baseline": "fb5a18ae3456032fe828ee458cce5f85183eb77b",
       "repository": "https://github.com/slimr-down-now/reflect",
-      "baseline": "9ede15a1560fd6ed17b2b8e397c7aac97f4c63c3",
       "packages": [
         "slimr-reflect"
       ]
     },
     {
       "kind": "git",
+      "baseline": "729a3fbbec39a391fe0a74126e77f5047fd78e3b",
       "repository": "https://github.com/slimr-down-now/bugsink",
-      "baseline": "96e8d252fe8993ab59e871d45b5ca08afff83f08",
       "packages": [
         "slimr-bugsink"
       ]
