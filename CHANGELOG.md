@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.1 - 2026-11-16
+
 - Initial release: `serve_core.hpp`, `serve_cli.hpp`, `serve_auth.hpp`, `serve_http.hpp`, `serve_daemon.hpp`, and `serve_relay.hpp`.
 - `serve`/`http` accept `--socket`, `--socket-mode` and `--socket-group` and serve the same routes on TCP and the Unix socket; `enable_serve` defaults take `.socketPath`, `.socketMode` and `.socketGroup`, and each listener is opt-in (`ServeHttpOptions::port` is now `std::optional<int>`).
 - The Unix socket runs tool calls as the local principal (`app.localScopes`) without OAuth; `HttpRouteRequest::unixSocket` tells custom routes which listener they're on.
