@@ -1,0 +1,48 @@
+{
+  "name": "slimr-serve",
+  "description": "Header-only typed tool servers and JSON CLIs",
+  "dependencies": [
+    {
+      "name": "slimr-bugsink",
+      "version>=": "0.1.1"
+    },
+    {
+      "name": "slimr-json",
+      "version>=": "0.1.1"
+    },
+    {
+      "name": "slimr-reflect",
+      "version>=": "0.1.1"
+    }
+  ],
+  "features": {
+    "http": {
+      "description": "Plain JSON HTTP and daemon server support via cpp-httplib",
+      "dependencies": [
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        }
+      ]
+    },
+    "tests": {
+      "description": "Dependencies for the standalone test suite",
+      "dependencies": [
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        },
+        {
+          "name": "slimr-test",
+          "version>=": "0.1.1"
+        }
+      ]
+    }
+  }
+}
