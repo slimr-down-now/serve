@@ -318,6 +318,7 @@ TEST_CASE("[http] error status code mapping covers 400, 401, 403, 404, 405, 413,
             r.status = slimr::TokenValidationResult::Status::Valid;
             r.principal.authenticated = true;
             r.principal.subject = "user-1";
+            r.principal.audience = std::string(ctx.expectedResource);
             r.principal.scopes = {"calc:write"};
             return r;
         }
@@ -325,6 +326,7 @@ TEST_CASE("[http] error status code mapping covers 400, 401, 403, 404, 405, 413,
             r.status = slimr::TokenValidationResult::Status::Valid;
             r.principal.authenticated = true;
             r.principal.subject = "user-2";
+            r.principal.audience = std::string(ctx.expectedResource);
             r.principal.scopes = {"calc:read"};
             return r;
         }

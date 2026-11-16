@@ -1,6 +1,7 @@
 #pragma once
 #include "serve.hpp"
 #include "serve_daemon.hpp"
+#include "serve_relay.hpp"
 
 #include <httplib.h>
 
@@ -30,254 +31,6 @@
 #include <vector>
 
 namespace slimr {
-
-#ifndef SLIMR_SERVE_HAS_AUTH
-// Fallback auth/route types for standalone build before 15-C0-serve-int merges serve_auth.hpp.
-struct HttpRouteRequest {
-    std::string method;
-    std::string path;
-    std::string rawQuery;
-    std::map<std::string, std::string> queryParams;
-    std::map<std::string, std::string> headers;
-    std::string body;
-    std::string remoteAddr;
-
-    std::optional<std::string> header(std::string_view name) const {
-        auto it = headers.find(serve_detail::ascii_lower(name));
-        if (it == headers.end())
-            return std::nullopt;
-        return it->second;
-    }
-
-    std::optional<std::string> query(std::string_view name) const {
-        auto it = queryParams.find(std::string(name));
-        if (it == queryParams.end())
-            return std::nullopt;
-        return it->second;
-    }
-};
-
-struct HttpRouteResponse {
-    int status{200};
-    std::string contentType{"application/json"};
-    std::map<std::string, std::string> headers;
-    std::string body;
-
-    static HttpRouteResponse json(int statusCode, const Json &value) {
-        HttpRouteResponse r;
-        r.status = statusCode;
-        r.contentType = "application/json";
-        r.body = slimr::write_json(value);
-        return r;
-    }
-
-    static HttpRouteResponse html(int statusCode, std::string htmlBody) {
-        HttpRouteResponse r;
-        r.status = statusCode;
-        r.contentType = "text/html; charset=utf-8";
-        r.body = std::move(htmlBody);
-        return r;
-    }
-
-    static HttpRouteResponse redirect(std::string location, int statusCode = 302) {
-        HttpRouteResponse r;
-        r.status = statusCode;
-        r.contentType = "text/plain; charset=utf-8";
-        r.headers["Location"] = std::move(location);
-        return r;
-    }
-};
-
-struct CustomHttpRoute {
-    std::string method;
-    std::string path;
-    bool enforceSameOrigin{true};
-    std::function<HttpRouteResponse(const HttpRouteRequest &)> handler;
-};
-
-struct OAuthResourceMetadata {
-    std::string resource;
-    std::vector<std::string> authorizationServers;
-    std::vector<std::string> scopesSupported;
-    std::vector<std::string> bearerMethodsSupported{"header"};
-    std::string resourceName;
-    std::string resourceDocumentation;
-};
-
-struct TokenValidationContext {
-    std::string_view token;
-    std::string_view expectedResource;
-    const HttpRouteRequest &request;
-};
-
-struct TokenValidationResult {
-    enum class Status {
-        Valid,
-        InvalidToken,
-        InsufficientScope,
-        ServiceUnavailable
-    };
-
-    Status status{Status::InvalidToken};
-    Principal principal;
-    std::string errorDescription;
-    std::vector<std::string> requiredScopes;
-};
-
-using TokenValidatorFn = std::function<TokenValidationResult(const TokenValidationContext &)>;
-
-struct OAuthResourceConfig {
-    bool enabled{false};
-    bool protectDiscover{true};
-    OAuthResourceMetadata metadata;
-    std::vector<std::string> expectedIssuers;
-    std::vector<std::string> defaultScopes;
-    std::string metadataPath{"/.well-known/oauth-protected-resource"};
-    TokenValidatorFn validateToken;
-};
-
-namespace serve_detail {
-
-inline std::optional<std::string> extract_bearer_token(std::string_view authHeader) {
-    while (!authHeader.empty() && authHeader.front() == ' ')
-        authHeader.remove_prefix(1);
-    while (!authHeader.empty() && authHeader.back() == ' ')
-        authHeader.remove_suffix(1);
-    if (authHeader.size() < 8)
-        return std::nullopt;
-    if (ascii_lower(authHeader.substr(0, 7)) != "bearer ")
-        return std::nullopt;
-    std::string_view token = authHeader.substr(7);
-    while (!token.empty() && token.front() == ' ')
-        token.remove_prefix(1);
-    if (token.empty())
-        return std::nullopt;
-    return std::string(token);
-}
-
-inline std::string quote_header_param(std::string_view v) {
-    std::string out;
-    out.reserve(v.size() + 2);
-    out.push_back('"');
-    for (char c : v) {
-        if (c == '"' || c == '\\')
-            out.push_back('\\');
-        if (c != '\r' && c != '\n')
-            out.push_back(c);
-    }
-    out.push_back('"');
-    return out;
-}
-
-inline std::string build_www_authenticate(std::string_view resourceMetadataUrl,
-                                          std::string_view error,
-                                          std::span<const std::string> scopes,
-                                          std::string_view errorDescription) {
-    std::string h = "Bearer";
-    bool first = true;
-    auto addParam = [&](std::string_view k, std::string_view val) {
-        h += first ? " " : ", ";
-        first = false;
-        h += k;
-        h += "=";
-        h += quote_header_param(val);
-    };
-    if (!resourceMetadataUrl.empty())
-        addParam("resource_metadata", resourceMetadataUrl);
-    if (!error.empty())
-        addParam("error", error);
-    if (!scopes.empty()) {
-        std::string joined;
-        for (size_t i = 0; i < scopes.size(); ++i) {
-            if (i > 0)
-                joined.push_back(' ');
-            joined += scopes[i];
-        }
-        addParam("scope", joined);
-    }
-    if (!errorDescription.empty())
-        addParam("error_description", errorDescription);
-    return h;
-}
-
-inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig &oauth,
-                                                  const HttpRouteRequest &req,
-                                                  std::string_view expectedResource,
-                                                  std::span<const std::string> requiredScopes) {
-    auto authHdr = req.header("authorization");
-    if (!authHdr) {
-        return TokenValidationResult{
-            .status = TokenValidationResult::Status::InvalidToken,
-            .errorDescription = "Missing Authorization header",
-            .requiredScopes = std::vector<std::string>(requiredScopes.begin(), requiredScopes.end()),
-        };
-    }
-    auto token = extract_bearer_token(*authHdr);
-    if (!token) {
-        return TokenValidationResult{
-            .status = TokenValidationResult::Status::InvalidToken,
-            .errorDescription = "Invalid Authorization Bearer header",
-            .requiredScopes = std::vector<std::string>(requiredScopes.begin(), requiredScopes.end()),
-        };
-    }
-    if (!oauth.validateToken) {
-        return TokenValidationResult{
-            .status = TokenValidationResult::Status::ServiceUnavailable,
-            .errorDescription = "Token validator is not configured",
-        };
-    }
-    TokenValidationResult res = oauth.validateToken(TokenValidationContext{
-        .token = *token,
-        .expectedResource = expectedResource,
-        .request = req,
-    });
-    if (res.status != TokenValidationResult::Status::Valid)
-        return res;
-    if (!res.principal.authenticated) {
-        res.status = TokenValidationResult::Status::InvalidToken;
-        if (res.errorDescription.empty())
-            res.errorDescription = "Token did not yield an authenticated principal";
-        return res;
-    }
-    if (!requiredScopes.empty() && !res.principal.hasScope("*")) {
-        std::span<const std::string> reqSpan(requiredScopes.data(), requiredScopes.size());
-        if (!res.principal.hasAllScopes(reqSpan)) {
-            res.status = TokenValidationResult::Status::InsufficientScope;
-            res.requiredScopes.assign(requiredScopes.begin(), requiredScopes.end());
-            if (res.errorDescription.empty())
-                res.errorDescription = "Token lacks required scopes";
-            return res;
-        }
-    }
-    return res;
-}
-
-inline bool checkAuthorization(const ServeApp &app,
-                               const Principal &principal,
-                               std::string_view operation,
-                               std::span<const std::string> toolRequiredScopes,
-                               std::string &outError) {
-    if (!toolRequiredScopes.empty() && !principal.hasScope("*")) {
-        if (!principal.hasAllScopes(toolRequiredScopes)) {
-            outError = "Insufficient scope for operation: " + std::string(operation);
-            return false;
-        }
-    }
-    if (!app.defaultRequiredScopes.empty() && !principal.hasScope("*")) {
-        std::span<const std::string> defSpan(app.defaultRequiredScopes.data(), app.defaultRequiredScopes.size());
-        if (!principal.hasAllScopes(defSpan)) {
-            outError = "Insufficient default scope for operation: " + std::string(operation);
-            return false;
-        }
-    }
-    if (app.authorizer) {
-        return app.authorizer(principal, operation, outError);
-    }
-    return true;
-}
-
-} // namespace serve_detail
-#endif // SLIMR_SERVE_HAS_AUTH
 
 namespace serve_detail {
 
@@ -836,11 +589,7 @@ class ServeHttpServer {
         HttpRouteRequest routeReq = toRouteRequest(req);
         Principal principal;
         if (opts_.oauth.enabled) {
-            std::vector<std::string> reqScopes = def->requiredScopes.empty()
-                                                     ? opts_.oauth.defaultScopes
-                                                     : def->requiredScopes;
-            std::span<const std::string> scopeSpan(reqScopes.data(), reqScopes.size());
-            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, routeReq, baseUrl(), scopeSpan);
+            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, baseUrl(), routeReq);
             if (authRes.status == TokenValidationResult::Status::InvalidToken) {
                 sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription);
                 return;
@@ -856,13 +605,16 @@ class ServeHttpServer {
             principal = std::move(authRes.principal);
         }
 
-        std::string authErr;
         std::span<const std::string> toolScopeSpan(def->requiredScopes.data(), def->requiredScopes.size());
-        if (!serve_detail::checkAuthorization(app_, principal, def->name, toolScopeSpan, authErr)) {
-            Json body = json_obj();
-            body["error"] = "forbidden";
-            body["message"] = authErr;
-            sendJsonText(res, 403, slimr::write_json(body));
+        if (auto authErr = checkAuthorization(app_, principal, toolScopeSpan, def->name)) {
+            if (opts_.oauth.enabled && authErr->code == ServeErrorCode::InsufficientScope) {
+                sendOAuthInsufficientScope(res, authErr->requiredScopes, authErr->message);
+            } else {
+                Json body = json_obj();
+                body["error"] = "forbidden";
+                body["message"] = authErr->message;
+                sendJsonText(res, authErr->httpStatus, slimr::write_json(body));
+            }
             return;
         }
 
@@ -1104,8 +856,9 @@ class ServeHttpServer {
     std::atomic<uint16_t> boundPort_{0};
 };
 
-/** Attaches standalone `serve [--host <addr>] [--port <n>]` (and `http` alias) subcommand to ServeApp. */
+/** Attaches standalone `serve [--host <addr>] [--port <n>]` (and `http` alias) subcommand and CLI remote relay to ServeApp. */
 inline void enable_serve(ServeApp &app, ServeHttpOptions defaults = {}) {
+    enable_cli_relay(app);
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &target, int argc, char **argv) -> int {
         ServeHttpOptions opts = defaults;
         std::string subcmd = argc >= 2 ? std::string(argv[1]) : "serve";

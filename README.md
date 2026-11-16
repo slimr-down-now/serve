@@ -1,15 +1,15 @@
 # slimr-serve
 
-Header-only typed tool servers and JSON CLIs
+Header-only typed tool servers, JSON CLIs, and daemon lifecycle primitives for C++26
 
 ## Install
 
-Add `slimr-down-now/<repo>` to `vcpkg-configuration.json`:
+Add `slimr-down-now/serve` to `vcpkg-configuration.json`:
 
 ```json
 {
   "kind": "git",
-  "repository": "https://github.com/slimr-down-now/<repo>",
+  "repository": "https://github.com/slimr-down-now/serve",
   "baseline": "<commit-sha>",
   "packages": [
     "slimr-serve"
@@ -17,21 +17,38 @@ Add `slimr-down-now/<repo>` to `vcpkg-configuration.json`:
 }
 ```
 
-Declare `slimr-serve` in `vcpkg.json` and link `slimr-serve::slimr-serve` in `CMakeLists.txt`:
+Declare `slimr-serve` in `vcpkg.json` (add the `"http"` feature for `ServeHttpServer`, `DaemonServer`, and CLI remote relay) and link `slimr::serve` / `slimr::serve_http` in `CMakeLists.txt`:
 
 ```cmake
 find_package(slimr-serve CONFIG REQUIRED)
-target_link_libraries(my_target PRIVATE slimr-serve::slimr-serve)
+target_link_libraries(my_target PRIVATE slimr::serve)
+# With the "http" feature enabled:
+target_link_libraries(my_target PRIVATE slimr::serve_http)
 ```
-
-If your library needs one implementation TU (like rapidyaml), see `slimr-yaml`'s `INTERFACE_SOURCES` pattern in `ports/slimr-yaml/slimr-yaml-config.cmake`.
 
 ## Usage
 
 ```cpp
-#include <slimr-serve.hpp>
+#include <serve.hpp>
+#include <serve_http.hpp> // when using the "http" feature
 
-int sum = lib::add(2, 3);
+struct AddIn {
+    slimr::Field<int, "First operand"> a;
+    slimr::Field<int, "Second operand"> b;
+};
+
+struct AddOut {
+    slimr::Field<int, "Sum"> sum;
+};
+
+int main(int argc, char **argv) {
+    slimr::ServeApp app("calc", "0.1.0");
+    app.tool<AddIn>("add", "Add two numbers", [](const AddIn &in) {
+        return AddOut{.sum = in.a.value + in.b.value};
+    });
+    slimr::enable_serve(app, {.host = "127.0.0.1", .port = 10001});
+    return slimr::run_cli(app, argc, argv);
+}
 ```
 
 ## Build & Test
