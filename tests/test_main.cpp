@@ -9,6 +9,7 @@
 #include "test_cli.hpp"
 #include "test_core.hpp"
 #ifdef SLIMR_SERVE_HAS_HTTP
+#include "test_cli_relay.hpp"
 #include "test_daemon.hpp"
 #include "test_http.hpp"
 #endif
