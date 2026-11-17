@@ -155,7 +155,7 @@ inline std::map<std::string, std::string> parse_query_params(std::string_view ra
 
 /** Configuration options for ServeHttpServer; TCP and the Unix socket are each opt-in. */
 struct ServeHttpOptions {
-    std::string host{"0.0.0.0"};
+    std::string host{"127.0.0.1"};
     std::optional<int> port; // TCP listener when set; 0 binds an ephemeral port
     std::string publicBaseUrl;
     size_t maxRequestBytes{size_t{4} * 1024 * 1024};

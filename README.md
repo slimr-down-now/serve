@@ -65,7 +65,7 @@ calc serve --port 10001 --socket /path/run/calc.sock --socket-mode 0660 --socket
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--host <addr>` | `0.0.0.0` | TCP bind address (IP literal) |
+| `--host <addr>` | `127.0.0.1` | TCP bind address (IP literal; pass `0.0.0.0` to expose) |
 | `--port <n>` | app default | Enables the TCP listener |
 | `--socket <path>` | app default | Enables the Unix socket listener |
 | `--socket-mode <octal>` | `0600` | Socket file mode |

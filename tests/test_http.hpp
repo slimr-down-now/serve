@@ -790,3 +790,29 @@ TEST_CASE("[http] GET /openapi.json serves unauthenticated OpenAPI 3.1.0 and 405
         srv.stop();
     }
 }
+
+TEST_CASE("[http] default host is 127.0.0.1 when --host is omitted") {
+    slimr::ServeHttpOptions defaultOpts;
+    CHECK(defaultOpts.host == "127.0.0.1");
+
+    slimr::ServeApp app("loopback", "0.1.0");
+    slimr::ServeHttpServer srv(app, {.port = 0});
+    REQUIRE(srv.start());
+    CHECK(srv.baseUrl().starts_with("http://127.0.0.1:"));
+    srv.stop();
+
+    std::atomic<bool> started{false};
+    app.onServe = [&](std::stop_token) { started.store(true); };
+    slimr::enable_serve(app, {.port = 0});
+    std::ostringstream capturedErr;
+    auto *oldBuf = std::cerr.rdbuf(capturedErr.rdbuf());
+    {
+        serve_http_test::ServeRunner runner(app, {"loopback", "serve"});
+        for (int i = 0; i < 200 && !started.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        REQUIRE(started.load());
+        CHECK(runner.stop() == 0);
+    }
+    std::cerr.rdbuf(oldBuf);
+    CHECK(capturedErr.str().find("listening on http://127.0.0.1:") != std::string::npos);
+}

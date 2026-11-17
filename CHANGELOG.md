@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Default HTTP bind host is now `127.0.0.1` (was `0.0.0.0`); pass `--host 0.0.0.0` to expose.
+
 ## v0.2.0 - 2026-11-17
 
 - Generate OpenAPI 3.1.0 specs (`build_openapi_spec`), serve unauthenticated `GET /openapi.json`, and dump via `--openapi`.
