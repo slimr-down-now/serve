@@ -229,6 +229,7 @@ struct OAuthResourceConfig {
     std::vector<std::string> expectedIssuers;
     std::vector<std::string> defaultScopes;
     std::string metadataPath{"/.well-known/oauth-protected-resource"};
+    std::string expectedResource; // Expected token audience/resource; empty falls back to server baseUrl()
     TokenValidatorFn validateToken;
 };
 

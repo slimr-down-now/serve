@@ -1,7 +1,7 @@
 {
   "name": "slimr-serve",
   "version": "0.3.0",
-  "description": "Header-only typed tool servers and JSON CLIs",
+  "description": "Header-only typed tool servers",
   "dependencies": [
     {
       "name": "slimr-bugsink",
@@ -26,6 +26,22 @@
           "features": [
             "openssl"
           ]
+        }
+      ]
+    },
+    "yaml": {
+      "description": "Opt-in YAML request/response body support via slimr-yaml",
+      "dependencies": [
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        },
+        {
+          "name": "slimr-yaml",
+          "version>=": "0.1.1"
         }
       ]
     }

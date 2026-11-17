@@ -1,7 +1,6 @@
 #pragma once
 #include "serve.hpp"
 #include "serve_daemon.hpp"
-#include "serve_relay.hpp"
 
 #include <httplib.h>
 
@@ -10,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -71,24 +71,63 @@ inline std::string strip_http_params(std::string_view v) {
     return ascii_lower(v);
 }
 
+enum class StructuredFormat {
+    Json,
+    Yaml
+};
+
 inline bool is_json_content_type(std::string_view headerVal) {
     return strip_http_params(headerVal) == "application/json";
 }
 
-inline bool accepts_ndjson(std::string_view acceptHeader) {
+inline bool is_yaml_content_type(std::string_view headerVal) {
+    return strip_http_params(headerVal) == "application/yaml";
+}
+
+inline bool accepts_media_type(std::string_view acceptHeader, std::string_view mediaType) {
     size_t start = 0;
     while (start <= acceptHeader.size()) {
         auto comma = acceptHeader.find(',', start);
         std::string_view part = comma == std::string_view::npos
                                     ? acceptHeader.substr(start)
                                     : acceptHeader.substr(start, comma - start);
-        if (strip_http_params(part) == "application/x-ndjson")
+        if (strip_http_params(part) == mediaType)
             return true;
         if (comma == std::string_view::npos)
             break;
         start = comma + 1;
     }
     return false;
+}
+
+inline bool accepts_ndjson(std::string_view acceptHeader) {
+    return accepts_media_type(acceptHeader, "application/x-ndjson");
+}
+
+inline bool accepts_json(std::string_view acceptHeader) {
+    return accepts_media_type(acceptHeader, "application/json");
+}
+
+inline bool accepts_yaml(std::string_view acceptHeader) {
+    return accepts_media_type(acceptHeader, "application/yaml");
+}
+
+inline std::string_view strip_utf8_bom(std::string_view s) noexcept {
+    if (s.size() >= 3 &&
+        static_cast<unsigned char>(s[0]) == 0xEF &&
+        static_cast<unsigned char>(s[1]) == 0xBB &&
+        static_cast<unsigned char>(s[2]) == 0xBF) {
+        s.remove_prefix(3);
+    }
+    return s;
+}
+
+inline bool peek_starts_json(std::string_view s) noexcept {
+    s = strip_utf8_bom(s);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+        s.remove_prefix(1);
+    }
+    return !s.empty() && (s.front() == '{' || s.front() == '[');
 }
 
 inline std::map<std::string, std::string> parse_query_params(std::string_view rawUrl) {
@@ -165,9 +204,12 @@ struct ServeHttpOptions {
     int keepaliveTimeoutMs{30000};
     OAuthResourceConfig oauth;
     std::vector<CustomHttpRoute> customRoutes;
-    std::string socketPath; // Unix socket listener when set
+    bool toolRoutes{true};
+    std::string toolsPrefix; // Route prefix for /schema, /openapi.json, /:tool (no trailing '/'; empty = root)
+    std::string socketPath;  // Unix socket listener when set
     mode_t socketMode{0600};
     std::string socketGroup;
+    std::optional<YamlCodec> yaml;
 };
 
 using HttpServerOptions = ServeHttpOptions;
@@ -317,8 +359,9 @@ class ServeHttpServer {
         svr.set_pre_routing_handler([this](const httplib::Request &req, httplib::Response &res) {
             if (draining_.load(std::memory_order_acquire)) {
                 res.set_header("Connection", "close");
-                res.status = 503;
-                res.set_content("{\"error\":\"server_stopping\"}", "application/json");
+                Json err = json_obj();
+                err["error"] = "server_stopping";
+                sendStructured(res, 503, resolveResponseFormat(req, serve_detail::StructuredFormat::Json), err);
                 return httplib::Server::HandlerResponse::Handled;
             }
             if (req.has_header("Content-Length")) {
@@ -326,8 +369,9 @@ class ServeHttpServer {
                 char *endPtr = nullptr;
                 unsigned long long len = std::strtoull(cl.c_str(), &endPtr, 10);
                 if (endPtr == cl.c_str() || *endPtr != '\0' || len > opts_.maxRequestBytes) {
-                    res.status = 413;
-                    res.set_content("{\"error\":\"payload_too_large\"}", "application/json");
+                    Json err = json_obj();
+                    err["error"] = "payload_too_large";
+                    sendStructured(res, 413, resolveResponseFormat(req, serve_detail::StructuredFormat::Json), err);
                     return httplib::Server::HandlerResponse::Handled;
                 }
             }
@@ -356,66 +400,83 @@ class ServeHttpServer {
         svr.Delete("/health", methodNotAllowedGet);
         svr.Patch("/health", methodNotAllowedGet);
 
-        svr.Get("/schema", [this](const httplib::Request &, httplib::Response &res) {
-            Json toolsObj = json_obj();
-            for (const auto &[tName, def] : app_.tools()) {
-                Json entry = json_obj();
-                entry["name"] = def.name;
-                entry["description"] = def.description;
-                entry["inputSchema"] = def.inputSchema;
-                if (def.outputSchema.has_value())
-                    entry["outputSchema"] = *def.outputSchema;
-                Json ann = def.annotations.toJson();
-                if (!ann.empty())
-                    entry["annotations"] = std::move(ann);
-                entry["runsLocal"] = def.runsLocal;
-                entry["threadSafe"] = def.threadSafe;
-                toolsObj[tName] = std::move(entry);
-            }
-            Json body = json_obj();
-            body["name"] = app_.key;
-            body["version"] = app_.version;
-            body["apiVersion"] = app_.apiVersion;
-            body["tools"] = std::move(toolsObj);
-            sendJsonText(res, 200, slimr::write_json(body));
-        });
-        svr.Post("/schema", methodNotAllowedGet);
-        svr.Put("/schema", methodNotAllowedGet);
-        svr.Delete("/schema", methodNotAllowedGet);
-        svr.Patch("/schema", methodNotAllowedGet);
+        if (opts_.toolRoutes) {
+            std::string prefix = opts_.toolsPrefix;
+            while (prefix.size() > 1 && prefix.back() == '/')
+                prefix.pop_back();
+            if (prefix == "/")
+                prefix.clear();
 
-        svr.Get("/openapi.json", [this](const httplib::Request &, httplib::Response &res) {
-            OpenApiOptions oaOpts{
-                .oauthEnabled = opts_.oauth.enabled,
-                .serverUrl = (opts_.port.has_value() || !opts_.publicBaseUrl.empty()) ? baseUrl() : std::string{},
-            };
-            sendJsonText(res, 200, slimr::write_json(build_openapi_spec(app_, oaOpts)));
-        });
-        svr.Post("/openapi.json", methodNotAllowedGet);
-        svr.Put("/openapi.json", methodNotAllowedGet);
-        svr.Delete("/openapi.json", methodNotAllowedGet);
-        svr.Patch("/openapi.json", methodNotAllowedGet);
+            const std::string schemaPath = prefix + "/schema";
+            const std::string openApiPath = prefix + "/openapi.json";
+            const std::string toolPath = prefix + "/:tool";
 
-        svr.Post("/:tool", [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
-            try {
-                handleToolPost(req, res, watcher, isUnixSocket);
-            } catch (const std::exception &e) {
+            svr.Get(schemaPath, [this](const httplib::Request &, httplib::Response &res) {
+                Json toolsObj = json_obj();
+                for (const auto &[tName, def] : app_.tools()) {
+                    Json entry = json_obj();
+                    entry["name"] = def.name;
+                    entry["description"] = def.description;
+                    entry["inputSchema"] = def.inputSchema;
+                    if (def.outputSchema.has_value())
+                        entry["outputSchema"] = *def.outputSchema;
+                    Json ann = def.annotations.toJson();
+                    if (!ann.empty())
+                        entry["annotations"] = std::move(ann);
+                    entry["threadSafe"] = def.threadSafe;
+                    toolsObj[tName] = std::move(entry);
+                }
+                Json body = json_obj();
+                body["name"] = app_.key;
+                body["version"] = app_.version;
+                body["apiVersion"] = app_.apiVersion;
+                body["tools"] = std::move(toolsObj);
+                sendJsonText(res, 200, slimr::write_json(body));
+            });
+            svr.Post(schemaPath, methodNotAllowedGet);
+            svr.Put(schemaPath, methodNotAllowedGet);
+            svr.Delete(schemaPath, methodNotAllowedGet);
+            svr.Patch(schemaPath, methodNotAllowedGet);
+
+            svr.Get(openApiPath, [this, prefix](const httplib::Request &, httplib::Response &res) {
+                OpenApiOptions oaOpts{
+                    .oauthEnabled = opts_.oauth.enabled,
+                    .yamlEnabled = opts_.yaml.has_value(),
+                    .serverUrl = (opts_.port.has_value() || !opts_.publicBaseUrl.empty()) ? baseUrl() : std::string{},
+                    .pathPrefix = prefix,
+                };
+                sendJsonText(res, 200, slimr::write_json(build_openapi_spec(app_, oaOpts)));
+            });
+            svr.Post(openApiPath, methodNotAllowedGet);
+            svr.Put(openApiPath, methodNotAllowedGet);
+            svr.Delete(openApiPath, methodNotAllowedGet);
+            svr.Patch(openApiPath, methodNotAllowedGet);
+
+            svr.Post(toolPath, [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
+                try {
+                    handleToolPost(req, res, watcher, isUnixSocket);
+                } catch (const std::exception &e) {
+                    Json err = json_obj();
+                    err["error"] = "internal_error";
+                    err["message"] = redact_sensitive(e.what());
+                    sendStructured(res, 500, resolveResponseFormat(req, serve_detail::StructuredFormat::Json), err);
+                } catch (...) {
+                    Json err = json_obj();
+                    err["error"] = "internal_error";
+                    sendStructured(res, 500, resolveResponseFormat(req, serve_detail::StructuredFormat::Json), err);
+                }
+            });
+            auto methodNotAllowedPost = [this](const httplib::Request &req, httplib::Response &res) {
                 Json err = json_obj();
-                err["error"] = "internal_error";
-                err["message"] = redact_sensitive(e.what());
-                sendJsonText(res, 500, slimr::write_json(err));
-            } catch (...) {
-                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
-            }
-        });
-        auto methodNotAllowedPost = [](const httplib::Request &, httplib::Response &res) {
-            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
-                         {{"Allow", "POST"}});
-        };
-        svr.Get("/:tool", methodNotAllowedPost);
-        svr.Put("/:tool", methodNotAllowedPost);
-        svr.Delete("/:tool", methodNotAllowedPost);
-        svr.Patch("/:tool", methodNotAllowedPost);
+                err["error"] = "method_not_allowed";
+                sendStructured(res, 405, resolveResponseFormat(req, serve_detail::StructuredFormat::Json), err,
+                               {{"Allow", "POST"}});
+            };
+            svr.Get(toolPath, methodNotAllowedPost);
+            svr.Put(toolPath, methodNotAllowedPost);
+            svr.Delete(toolPath, methodNotAllowedPost);
+            svr.Patch(toolPath, methodNotAllowedPost);
+        }
     }
 
     static void sendResponse(httplib::Response &res,
@@ -435,6 +496,32 @@ class ServeHttpServer {
                              const std::string &jsonStr,
                              std::vector<std::pair<std::string, std::string>> extraHeaders = {}) {
         sendResponse(res, status, "application/json", jsonStr, std::move(extraHeaders));
+    }
+
+    serve_detail::StructuredFormat resolveResponseFormat(const httplib::Request &req,
+                                                         serve_detail::StructuredFormat detectedFormat) const {
+        if (!opts_.yaml.has_value())
+            return serve_detail::StructuredFormat::Json;
+        if (req.has_header("Accept")) {
+            std::string accept = req.get_header_value("Accept");
+            if (serve_detail::accepts_json(accept))
+                return serve_detail::StructuredFormat::Json;
+            if (serve_detail::accepts_yaml(accept))
+                return serve_detail::StructuredFormat::Yaml;
+        }
+        return detectedFormat;
+    }
+
+    void sendStructured(httplib::Response &res,
+                        int status,
+                        serve_detail::StructuredFormat format,
+                        const Json &body,
+                        std::vector<std::pair<std::string, std::string>> extraHeaders = {}) const {
+        if (format == serve_detail::StructuredFormat::Yaml && opts_.yaml.has_value() && opts_.yaml->emit) {
+            sendResponse(res, status, "application/yaml", opts_.yaml->emit(body), std::move(extraHeaders));
+        } else {
+            sendJsonText(res, status, slimr::write_json(body), std::move(extraHeaders));
+        }
     }
 
     static HttpRouteRequest toRouteRequest(const httplib::Request &req, bool isUnixSocket) {
@@ -505,32 +592,66 @@ class ServeHttpServer {
 
     void sendOAuthUnauthorized(httplib::Response &res,
                                std::span<const std::string> scopes,
-                               std::string_view desc) const {
+                               std::string_view desc,
+                               serve_detail::StructuredFormat format) const {
         std::string www = serve_detail::build_www_authenticate(
             resourceMetadataUrl(), "", scopes, "");
         Json body = json_obj();
         body["error"] = "unauthorized";
         body["error_description"] = std::string(desc);
-        sendJsonText(res, 401, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
+        sendStructured(res, 401, format, body, {{"WWW-Authenticate", std::move(www)}});
     }
 
     void sendOAuthInsufficientScope(httplib::Response &res,
                                     std::span<const std::string> scopes,
-                                    std::string_view desc) const {
+                                    std::string_view desc,
+                                    serve_detail::StructuredFormat format) const {
         std::string www = serve_detail::build_www_authenticate(
             resourceMetadataUrl(), "insufficient_scope", scopes, desc);
         Json body = json_obj();
         body["error"] = "insufficient_scope";
         body["error_description"] = std::string(desc);
-        sendJsonText(res, 403, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
+        sendStructured(res, 403, format, body, {{"WWW-Authenticate", std::move(www)}});
     }
 
     void handleToolPost(const httplib::Request &req,
                         httplib::Response &res,
                         DisconnectWatcher &watcher,
                         bool isUnixSocket) {
+        enum class InputMode {
+            ExplicitJson,
+            ExplicitYaml,
+            Detect
+        };
+        InputMode inputMode = InputMode::ExplicitJson;
+        auto detectedFormat = serve_detail::StructuredFormat::Json;
+        if (opts_.yaml.has_value()) {
+            if (req.has_header("Content-Type")) {
+                std::string ct = req.get_header_value("Content-Type");
+                if (serve_detail::is_json_content_type(ct)) {
+                    inputMode = InputMode::ExplicitJson;
+                    detectedFormat = serve_detail::StructuredFormat::Json;
+                } else if (serve_detail::is_yaml_content_type(ct)) {
+                    inputMode = InputMode::ExplicitYaml;
+                    detectedFormat = serve_detail::StructuredFormat::Yaml;
+                } else {
+                    inputMode = InputMode::Detect;
+                    detectedFormat = (req.body.empty() || serve_detail::peek_starts_json(req.body))
+                                         ? serve_detail::StructuredFormat::Json
+                                         : serve_detail::StructuredFormat::Yaml;
+                }
+            } else {
+                inputMode = InputMode::Detect;
+                detectedFormat = (req.body.empty() || serve_detail::peek_starts_json(req.body))
+                                     ? serve_detail::StructuredFormat::Json
+                                     : serve_detail::StructuredFormat::Yaml;
+            }
+        }
+
         if (req.body.size() > opts_.maxRequestBytes) {
-            sendJsonText(res, 413, "{\"error\":\"payload_too_large\"}");
+            Json err = json_obj();
+            err["error"] = "payload_too_large";
+            sendStructured(res, 413, resolveResponseFormat(req, detectedFormat), err);
             return;
         }
 
@@ -539,7 +660,10 @@ class ServeHttpServer {
             char *endPtr = nullptr;
             long clientVer = std::strtol(verStr.c_str(), &endPtr, 10);
             if (endPtr == verStr.c_str() || *endPtr != '\0' || clientVer < 0) {
-                sendJsonText(res, 400, "{\"error\":\"invalid_api_version\",\"message\":\"Invalid X-Slimr-Api-Version header\"}");
+                Json err = json_obj();
+                err["error"] = "invalid_api_version";
+                err["message"] = "Invalid X-Slimr-Api-Version header";
+                sendStructured(res, 400, resolveResponseFormat(req, detectedFormat), err);
                 return;
             }
             if (clientVer > app_.apiVersion) {
@@ -548,19 +672,21 @@ class ServeHttpServer {
                 body["message"] = "daemon older than client; restart it";
                 body["serverApiVersion"] = app_.apiVersion;
                 body["clientApiVersion"] = clientVer;
-                sendJsonText(res, 426, slimr::write_json(body));
+                sendStructured(res, 426, resolveResponseFormat(req, detectedFormat), body);
                 return;
             }
         }
 
-        if (req.has_header("Content-Type") &&
-            !serve_detail::is_json_content_type(req.get_header_value("Content-Type"))) {
-            sendJsonText(res, 415, "{\"error\":\"unsupported_media_type\",\"message\":\"Content-Type must be application/json\"}");
-            return;
-        }
-        if (!req.has_header("Content-Type") && !req.body.empty()) {
-            sendJsonText(res, 415, "{\"error\":\"unsupported_media_type\",\"message\":\"Content-Type must be application/json\"}");
-            return;
+        if (!opts_.yaml.has_value()) {
+            if (req.has_header("Content-Type") &&
+                !serve_detail::is_json_content_type(req.get_header_value("Content-Type"))) {
+                sendJsonText(res, 415, "{\"error\":\"unsupported_media_type\",\"message\":\"Content-Type must be application/json\"}");
+                return;
+            }
+            if (!req.has_header("Content-Type") && !req.body.empty()) {
+                sendJsonText(res, 415, "{\"error\":\"unsupported_media_type\",\"message\":\"Content-Type must be application/json\"}");
+                return;
+            }
         }
 
         auto toolIt = req.path_params.find("tool");
@@ -570,7 +696,7 @@ class ServeHttpServer {
             Json body = json_obj();
             body["error"] = "not_found";
             body["message"] = "Tool not found: " + toolName;
-            sendJsonText(res, 404, slimr::write_json(body));
+            sendStructured(res, 404, resolveResponseFormat(req, detectedFormat), body);
             return;
         }
 
@@ -579,17 +705,24 @@ class ServeHttpServer {
         if (isUnixSocket) {
             principal = local_principal(app_);
         } else if (opts_.oauth.enabled) {
-            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, baseUrl(), routeReq);
+            const std::string expectedRes =
+                opts_.oauth.expectedResource.empty() ? baseUrl() : opts_.oauth.expectedResource;
+            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, expectedRes, routeReq);
             if (authRes.status == TokenValidationResult::Status::InvalidToken) {
-                sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription);
+                sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription,
+                                      resolveResponseFormat(req, detectedFormat));
                 return;
             }
             if (authRes.status == TokenValidationResult::Status::InsufficientScope) {
-                sendOAuthInsufficientScope(res, authRes.requiredScopes, authRes.errorDescription);
+                sendOAuthInsufficientScope(res, authRes.requiredScopes, authRes.errorDescription,
+                                           resolveResponseFormat(req, detectedFormat));
                 return;
             }
             if (authRes.status == TokenValidationResult::Status::ServiceUnavailable) {
-                sendJsonText(res, 503, "{\"error\":\"service_unavailable\",\"message\":\"Auth service unavailable\"}");
+                Json err = json_obj();
+                err["error"] = "service_unavailable";
+                err["message"] = "Auth service unavailable";
+                sendStructured(res, 503, resolveResponseFormat(req, detectedFormat), err);
                 return;
             }
             principal = std::move(authRes.principal);
@@ -598,56 +731,115 @@ class ServeHttpServer {
         std::span<const std::string> toolScopeSpan(def->requiredScopes.data(), def->requiredScopes.size());
         if (auto authErr = checkAuthorization(app_, principal, toolScopeSpan, def->name)) {
             if (opts_.oauth.enabled && !isUnixSocket && authErr->code == ServeErrorCode::InsufficientScope) {
-                sendOAuthInsufficientScope(res, authErr->requiredScopes, authErr->message);
+                sendOAuthInsufficientScope(res, authErr->requiredScopes, authErr->message,
+                                           resolveResponseFormat(req, detectedFormat));
             } else {
                 Json body = json_obj();
                 body["error"] = "forbidden";
                 body["message"] = authErr->message;
-                sendJsonText(res, authErr->httpStatus, slimr::write_json(body));
+                sendStructured(res, authErr->httpStatus, resolveResponseFormat(req, detectedFormat), body);
             }
             return;
         }
 
         Json parsedBody = json_obj();
         if (!req.body.empty()) {
-            auto parsed = parse_json<Json>(req.body);
-            if (!parsed) {
-                sendJsonText(res, 400, "{\"error\":\"invalid_json\",\"message\":\"Malformed JSON request body\"}");
-                return;
-            }
-            if (!parsed->is_object()) {
-                sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Request body must be a JSON object\"}");
-                return;
-            }
-            parsedBody = std::move(*parsed);
-        }
-
-        Json args = parsedBody;
-        RequestContext ctx;
-        ctx.principal = std::move(principal);
-        bool hasInputSchemaProp = def->inputSchema.contains("properties") &&
-                                  def->inputSchema["properties"].is_object() &&
-                                  def->inputSchema["properties"].contains("input");
-        bool isEnvelope = parsedBody.contains("input") &&
-                          (parsedBody.contains("context") || (parsedBody.size() == 1 && !hasInputSchemaProp));
-        if (isEnvelope) {
-            if (!parsedBody["input"].is_object()) {
-                sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Envelope 'input' must be a JSON object\"}");
-                return;
-            }
-            args = parsedBody["input"];
-            if (parsedBody.contains("context")) {
-                if (!parsedBody["context"].is_object()) {
-                    sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Envelope 'context' must be a JSON object\"}");
+            if (!opts_.yaml.has_value()) {
+                auto parsed = parse_json<Json>(req.body);
+                if (!parsed) {
+                    sendJsonText(res, 400, "{\"error\":\"invalid_json\",\"message\":\"Malformed JSON request body\"}");
                     return;
                 }
-                const Json &c = parsedBody["context"];
-                if (c.contains("session") && c["session"].is_string()) {
-                    ctx.session = c["session"].get<std::string>();
+                if (!parsed->is_object()) {
+                    sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Request body must be a JSON object\"}");
+                    return;
+                }
+                parsedBody = std::move(*parsed);
+            } else {
+                auto failJson = [&]() {
+                    detectedFormat = serve_detail::StructuredFormat::Json;
+                    Json err = json_obj();
+                    err["error"] = "invalid_json";
+                    err["message"] = "Malformed JSON request body";
+                    sendStructured(res, 400, resolveResponseFormat(req, detectedFormat), err);
+                };
+                auto failYaml = [&](std::string_view msg) {
+                    detectedFormat = serve_detail::StructuredFormat::Yaml;
+                    Json err = json_obj();
+                    err["error"] = "invalid_yaml";
+                    err["message"] = msg.empty() ? "Malformed YAML request body" : std::string(msg);
+                    sendStructured(res, 400, resolveResponseFormat(req, detectedFormat), err);
+                };
+
+                std::string_view trimmed = serve_detail::strip_utf8_bom(req.body);
+                if (inputMode == InputMode::ExplicitJson) {
+                    auto parsed = parse_json<Json>(req.body);
+                    if (!parsed) {
+                        failJson();
+                        return;
+                    }
+                    detectedFormat = serve_detail::StructuredFormat::Json;
+                    parsedBody = std::move(*parsed);
+                } else if (inputMode == InputMode::ExplicitYaml) {
+                    if (!opts_.yaml->parse) {
+                        failYaml("YAML parser not configured");
+                        return;
+                    }
+                    auto parsed = opts_.yaml->parse(trimmed);
+                    if (!parsed) {
+                        failYaml(parsed.error());
+                        return;
+                    }
+                    detectedFormat = serve_detail::StructuredFormat::Yaml;
+                    parsedBody = std::move(*parsed);
+                } else {
+                    if (serve_detail::peek_starts_json(req.body)) {
+                        auto jsonParsed = parse_json<Json>(trimmed);
+                        if (jsonParsed) {
+                            detectedFormat = serve_detail::StructuredFormat::Json;
+                            parsedBody = std::move(*jsonParsed);
+                        } else if (opts_.yaml->parse) {
+                            auto yamlParsed = opts_.yaml->parse(trimmed);
+                            if (yamlParsed) {
+                                detectedFormat = serve_detail::StructuredFormat::Yaml;
+                                parsedBody = std::move(*yamlParsed);
+                            } else {
+                                failJson();
+                                return;
+                            }
+                        } else {
+                            failJson();
+                            return;
+                        }
+                    } else {
+                        if (!opts_.yaml->parse) {
+                            failYaml("YAML parser not configured");
+                            return;
+                        }
+                        auto yamlParsed = opts_.yaml->parse(trimmed);
+                        if (!yamlParsed) {
+                            failYaml(yamlParsed.error());
+                            return;
+                        }
+                        detectedFormat = serve_detail::StructuredFormat::Yaml;
+                        parsedBody = std::move(*yamlParsed);
+                    }
+                }
+                if (!parsedBody.is_object()) {
+                    Json err = json_obj();
+                    err["error"] = "invalid_params";
+                    err["message"] = "Request body must be a JSON object";
+                    sendStructured(res, 400, resolveResponseFormat(req, detectedFormat), err);
+                    return;
                 }
             }
         }
 
+        Json args = std::move(parsedBody);
+        RequestContext ctx;
+        ctx.principal = std::move(principal);
+
+        auto outFormat = resolveResponseFormat(req, detectedFormat);
         bool wantNdjson = req.has_header("Accept") &&
                           serve_detail::accepts_ndjson(req.get_header_value("Accept"));
 
@@ -658,7 +850,9 @@ class ServeHttpServer {
             std::lock_guard lock(drain_->mu);
             if (draining_.load(std::memory_order_acquire)) {
                 res.set_header("Connection", "close");
-                sendJsonText(res, 503, "{\"error\":\"server_stopping\"}");
+                Json err = json_obj();
+                err["error"] = "server_stopping";
+                sendStructured(res, 503, outFormat, err);
                 return;
             }
             ++drain_->activeCount;
@@ -702,7 +896,7 @@ class ServeHttpServer {
                 body["error"] = "tool_error";
                 body["code"] = e.code;
                 body["message"] = redact_sensitive(e.what());
-                sendJsonText(res, e.httpStatus, slimr::write_json(body));
+                sendStructured(res, e.httpStatus, outFormat, body);
                 finishResponse();
                 return;
             } catch (const std::exception &e) {
@@ -710,7 +904,7 @@ class ServeHttpServer {
                 Json body = json_obj();
                 body["error"] = "internal_error";
                 body["message"] = redact_sensitive(e.what());
-                sendJsonText(res, 500, slimr::write_json(body));
+                sendStructured(res, 500, outFormat, body);
                 finishResponse();
                 return;
             }
@@ -721,9 +915,9 @@ class ServeHttpServer {
                 Json body = json_obj();
                 body["error"] = "tool_error";
                 body["message"] = redact_sensitive(toolRes.errorMessage);
-                sendJsonText(res, status, slimr::write_json(body));
+                sendStructured(res, status, outFormat, body);
             } else {
-                sendJsonText(res, 200, slimr::write_json(toolRes.toJson()));
+                sendStructured(res, 200, outFormat, toolRes.toJson());
             }
             finishResponse();
             return;
@@ -846,10 +1040,8 @@ class ServeHttpServer {
     std::atomic<uint16_t> boundPort_{0};
 };
 
-/** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags and CLI remote relay to ServeApp. */
+/** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags to ServeApp. */
 inline void enable_serve(ServeApp &app, ServeHttpOptions defaults = {}) {
-    enable_cli_relay(app);
-    app.openApiDefaults.oauthEnabled = defaults.oauth.enabled;
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &target, int argc, char **argv) -> int {
         ServeHttpOptions opts = defaults;
         std::string prog = target.key.empty() ? "app" : target.key;

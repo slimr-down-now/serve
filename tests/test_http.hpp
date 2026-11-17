@@ -104,7 +104,10 @@ inline bool wait_for_health(httplib::Client &cli) {
 
 } // namespace serve_http_test
 
-TEST_CASE("[http] POST /<tool> handles direct JSON, envelope context, and empty body") {
+TEST_CASE("[http] POST /<tool> handles direct JSON, empty body, and passes envelope-shaped body raw on TCP and Unix socket") {
+    serve_daemon_server_test::TempDirGuard tmp("raw-env");
+    auto sockPath = (tmp.dir / "raw.sock").string();
+
     slimr::ServeApp app("calc", "1.2.3");
     app.apiVersion = 2;
     app.tool<serve_http_test::AddIn>(
@@ -113,24 +116,25 @@ TEST_CASE("[http] POST /<tool> handles direct JSON, envelope context, and empty 
         [](const serve_http_test::AddIn &in) {
             return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
         });
-    app.tool<serve_http_test::SessionIn>(
-        "echo_session",
-        "Return session and msg",
-        [](const serve_http_test::SessionIn &in, const slimr::RequestContext &ctx) {
-            return serve_http_test::SessionOut{
-                .session = ctx.session.value_or("none"),
-                .msg = in.msg.value.empty() ? std::string("empty") : in.msg.value,
-            };
-        });
+    app.registerTool(slimr::ToolDef{
+        .name = "echo_raw",
+        .description = "Echo raw JSON args",
+        .inputSchema = slimr::schema<serve_http_test::EmptyIn>(),
+        .handler = [](const slimr::Json &args, const slimr::RequestContext &) {
+            return slimr::ServeResult::json(args);
+        },
+    });
 
     slimr::ServeHttpOptions opts;
     opts.host = "127.0.0.1";
     opts.port = 0;
+    opts.socketPath = sockPath;
     slimr::ServeHttpServer srv(app, opts);
     std::string err;
     REQUIRE(srv.start(&err));
 
     httplib::Client cli("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
 
     auto res1 = cli.Post("/add", R"({"a":7,"b":5})", "application/json");
     REQUIRE(res1);
@@ -139,24 +143,23 @@ TEST_CASE("[http] POST /<tool> handles direct JSON, envelope context, and empty 
     REQUIRE(j1.has_value());
     CHECK((*j1)["sum"].get<int64_t>() == 12);
 
-    auto res2 = cli.Post(
-        "/echo_session",
-        R"({"input":{"msg":"hi"},"context":{"session":"s-42"}})",
-        "application/json");
-    REQUIRE(res2);
-    CHECK(res2->status == 200);
-    auto j2 = slimr::parse_json<slimr::Json>(res2->body);
-    REQUIRE(j2.has_value());
-    CHECK((*j2)["session"].get<std::string>() == "s-42");
-    CHECK((*j2)["msg"].get<std::string>() == "hi");
+    const std::string envelopeBody = R"({"input":{"msg":"hi"},"context":{"session":"s-42"}})";
+    for (auto *c : {&cli, &sock}) {
+        auto res2 = c->Post("/echo_raw", envelopeBody, "application/json");
+        REQUIRE(res2);
+        CHECK(res2->status == 200);
+        auto j2 = slimr::parse_json<slimr::Json>(res2->body);
+        REQUIRE(j2.has_value());
+        CHECK((*j2)["input"]["msg"].get<std::string>() == "hi");
+        CHECK((*j2)["context"]["session"].get<std::string>() == "s-42");
+    }
 
-    auto res3 = cli.Post("/echo_session", "", "application/json");
+    auto res3 = cli.Post("/echo_raw", "", "application/json");
     REQUIRE(res3);
     CHECK(res3->status == 200);
     auto j3 = slimr::parse_json<slimr::Json>(res3->body);
     REQUIRE(j3.has_value());
-    CHECK((*j3)["session"].get<std::string>() == "none");
-    CHECK((*j3)["msg"].get<std::string>() == "empty");
+    CHECK(j3->empty());
 
     srv.stop();
 }
@@ -239,7 +242,7 @@ TEST_CASE("[http] GET /health and GET /schema expose metadata and reflected sche
     app.tool<serve_http_test::AddIn>(
         "add",
         "Add numbers",
-        slimr::ToolOptions{.annotations = {.readOnlyHint = true}, .threadSafe = true, .runsLocal = true},
+        slimr::ToolOptions{.annotations = {.readOnlyHint = true}, .threadSafe = true},
         [](const serve_http_test::AddIn &in) {
             return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
         });
@@ -275,7 +278,7 @@ TEST_CASE("[http] GET /health and GET /schema expose metadata and reflected sche
     REQUIRE(sj.has_value());
     CHECK((*sj)["apiVersion"].get<int64_t>() == 7);
     REQUIRE((*sj)["tools"].contains("add"));
-    CHECK((*sj)["tools"]["add"]["runsLocal"].get<bool>());
+    CHECK_FALSE((*sj)["tools"]["add"].contains("runsLocal"));
     CHECK((*sj)["tools"]["add"]["threadSafe"].get<bool>());
     CHECK((*sj)["tools"]["add"]["inputSchema"]["properties"].contains("a"));
     CHECK((*sj)["tools"]["add"]["outputSchema"]["properties"].contains("sum"));
@@ -560,7 +563,7 @@ TEST_CASE("[http] enable_serve and enable_http attach runner and validate --port
     CHECK(app2.hasHttpRunner());
 }
 
-TEST_CASE("[http] serve --socket serves POST /<tool>, relays from the CLI, and holds a single-instance lock") {
+TEST_CASE("[http] serve --socket serves POST /<tool> and holds a single-instance lock") {
     serve_daemon_server_test::TempDirGuard tmp("ss");
     auto sockPath = (tmp.dir / "serve.sock").string();
 
@@ -584,22 +587,6 @@ TEST_CASE("[http] serve --socket serves POST /<tool>, relays from the CLI, and h
     auto j = slimr::parse_json<slimr::Json>(res->body);
     REQUIRE(j.has_value());
     CHECK((*j)["sum"].get<int64_t>() == 5);
-
-    const auto *def = app.findTool("add");
-    REQUIRE(def != nullptr);
-    std::string remote = "unix:" + sockPath;
-    char prog[] = "sock-serve";
-    char rFlag[] = "--remote";
-    char toolArg[] = "add";
-    char *argv[] = {prog, rFlag, remote.data(), toolArg};
-    slimr::Json args = slimr::json_obj();
-    args["a"] = 4;
-    args["b"] = 6;
-    slimr::RequestContext ctx;
-    std::ostringstream out;
-    std::ostringstream err;
-    CHECK(slimr::run_cli_relay(app, *def, args, ctx, 4, argv, out, err) == 0);
-    CHECK(out.str().find("\"sum\":10") != std::string::npos);
 
     CHECK(serve_http_test::run_serve(app, {"sock-serve", "serve", "--socket", sockPath}) == 1);
 
@@ -741,7 +728,6 @@ TEST_CASE("[http] GET /openapi.json serves unauthenticated OpenAPI 3.1.0 and 405
             return slimr::TokenValidationResult{};
         };
         slimr::enable_serve(app, opts);
-        CHECK(app.openApiDefaults.oauthEnabled);
 
         slimr::ServeHttpServer srv(app, opts);
         REQUIRE(srv.start());
@@ -815,4 +801,287 @@ TEST_CASE("[http] default host is 127.0.0.1 when --host is omitted") {
     }
     std::cerr.rdbuf(oldBuf);
     CHECK(capturedErr.str().find("listening on http://127.0.0.1:") != std::string::npos);
+}
+
+TEST_CASE("[http] toolRoutes=false returns 404 on tool routes while keeping /health and customRoutes") {
+    slimr::ServeApp app("no-tools", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.toolRoutes = false;
+    opts.customRoutes.push_back(slimr::CustomHttpRoute{
+        .method = "POST",
+        .path = "/mcp",
+        .handler = [](const slimr::HttpRouteRequest &) {
+            return slimr::HttpRouteResponse::json(200, slimr::json_obj());
+        },
+    });
+
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+    httplib::Client cli("127.0.0.1", srv.boundPort());
+
+    auto health = cli.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+
+    auto mcp = cli.Post("/mcp", "{}", "application/json");
+    REQUIRE(mcp);
+    CHECK(mcp->status == 200);
+
+    auto oa = cli.Get("/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 404);
+
+    auto sc = cli.Get("/schema");
+    REQUIRE(sc);
+    CHECK(sc->status == 404);
+
+    auto tool = cli.Post("/add", R"({"a":1,"b":2})", "application/json");
+    REQUIRE(tool);
+    CHECK(tool->status == 404);
+
+    srv.stop();
+}
+
+TEST_CASE("[http] toolsPrefix mounts /schema, /openapi.json, and /:tool under prefix and 404s at root") {
+    slimr::ServeApp app("prefixed", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.toolsPrefix = "/tools";
+
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+    httplib::Client cli("127.0.0.1", srv.boundPort());
+
+    // Root tool routes return 404
+    CHECK(cli.Get("/openapi.json")->status == 404);
+    CHECK(cli.Get("/schema")->status == 404);
+    CHECK(cli.Post("/add", R"({"a":1,"b":2})", "application/json")->status == 404);
+
+    // Prefixed routes work
+    auto oa = cli.Get("/tools/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 200);
+    auto spec = slimr::parse_json<slimr::Json>(oa->body);
+    REQUIRE(spec.has_value());
+    CHECK((*spec)["paths"].contains("/tools/add"));
+    CHECK_FALSE((*spec)["paths"].contains("/add"));
+
+    auto sc = cli.Get("/tools/schema");
+    REQUIRE(sc);
+    CHECK(sc->status == 200);
+    auto sj = slimr::parse_json<slimr::Json>(sc->body);
+    REQUIRE(sj.has_value());
+    CHECK((*sj)["tools"].contains("add"));
+
+    auto res = cli.Post("/tools/add", R"({"a":3,"b":4})", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = slimr::parse_json<slimr::Json>(res->body);
+    REQUIRE(j.has_value());
+    CHECK((*j)["sum"].get<int64_t>() == 7);
+
+    srv.stop();
+}
+
+TEST_CASE("[http] oauth.expectedResource overrides baseUrl in validateToken") {
+    slimr::ServeApp app("oauth-res", "0.1.0");
+    app.tool<serve_http_test::EmptyIn>("ping", "Ping", [](const serve_http_test::EmptyIn &) {
+        return std::string("pong");
+    });
+
+    std::string seenExpectedResource;
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.oauth.enabled = true;
+    opts.oauth.expectedResource = "https://example.test/mcp";
+    opts.oauth.validateToken = [&seenExpectedResource](const slimr::TokenValidationContext &ctx) {
+        seenExpectedResource = std::string(ctx.expectedResource);
+        slimr::TokenValidationResult r;
+        r.status = slimr::TokenValidationResult::Status::Valid;
+        r.principal.authenticated = true;
+        r.principal.subject = "u1";
+        r.principal.audience = std::string(ctx.expectedResource);
+        return r;
+    };
+
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+    httplib::Client cli("127.0.0.1", srv.boundPort());
+
+    auto res = cli.Post("/ping", httplib::Headers{{"Authorization", "Bearer tok"}}, "{}", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(seenExpectedResource == "https://example.test/mcp");
+
+    srv.stop();
+}
+
+TEST_CASE("[http] non-opted ServeHttpServer rejects application/yaml, form-urlencoded, and missing Content-Type with 415") {
+    serve_daemon_server_test::TempDirGuard tmp("no-yaml");
+    auto sockPath = (tmp.dir / "no-yaml.sock").string();
+
+    slimr::ServeApp app("no-yaml", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.socketPath = sockPath;
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+
+    httplib::Client tcp("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
+
+    for (auto *c : {&tcp, &sock}) {
+        auto rYaml = c->Post("/add", "a: 1\nb: 2\n", "application/yaml");
+        REQUIRE(rYaml);
+        CHECK(rYaml->status == 415);
+
+        auto rForm = c->Post("/add", R"({"a":1,"b":2})", "application/x-www-form-urlencoded");
+        REQUIRE(rForm);
+        CHECK(rForm->status == 415);
+
+        // Post without Content-Type and non-empty body
+        httplib::Request rawReq;
+        rawReq.method = "POST";
+        rawReq.path = "/add";
+        rawReq.body = R"({"a":1,"b":2})";
+        auto rMissing = c->send(rawReq);
+        REQUIRE(rMissing);
+        CHECK(rMissing->status == 415);
+    }
+
+    auto oa = tcp.Get("/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 200);
+    auto spec = slimr::parse_json<slimr::Json>(oa->body);
+    REQUIRE(spec.has_value());
+    CHECK_FALSE((*spec)["info"].contains("description"));
+
+    srv.stop();
+}
+
+TEST_CASE("[http] ServeHttpOptions.yaml hook supports detection, fallback, Accept override, and OpenAPI note") {
+    serve_daemon_server_test::TempDirGuard tmp("yaml-hook");
+    auto sockPath = (tmp.dir / "yaml-hook.sock").string();
+
+    slimr::ServeApp app("yaml-hook", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.socketPath = sockPath;
+    opts.yaml = slimr::YamlCodec{
+        .parse = [](std::string_view sv) -> std::expected<slimr::Json, std::string> {
+            if (sv == "{a: 1, b: 2}") {
+                slimr::Json j = slimr::json_obj();
+                j["a"] = 1;
+                j["b"] = 2;
+                return j;
+            }
+            if (sv == "a: 3\nb: 4\n" || sv == "  a: 3\nb: 4\n") {
+                slimr::Json j = slimr::json_obj();
+                j["a"] = 3;
+                j["b"] = 4;
+                return j;
+            }
+            return std::unexpected("bad yaml");
+        },
+        .emit = [](const slimr::Json &j) -> std::string {
+            return "yaml:" + slimr::write_json(j);
+        },
+    };
+
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+
+    httplib::Client tcp("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
+
+    // Explicit application/yaml over TCP and Unix socket -> YAML out
+    for (auto *c : {&tcp, &sock}) {
+        auto r = c->Post("/add", "a: 3\nb: 4\n", "application/yaml");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Content-Type") == "application/yaml");
+        CHECK(r->body == R"(yaml:{"sum":7})");
+    }
+
+    // Explicit application/json with Accept: application/yaml -> YAML out
+    auto rOverrideYaml = tcp.Post("/add",
+                                  httplib::Headers{{"Accept", "application/yaml"}},
+                                  R"({"a":2,"b":5})",
+                                  "application/json");
+    REQUIRE(rOverrideYaml);
+    CHECK(rOverrideYaml->status == 200);
+    CHECK(rOverrideYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rOverrideYaml->body == R"(yaml:{"sum":7})");
+
+    // Accept with both application/json and application/yaml -> JSON wins (Q2)
+    auto rBothAccept = tcp.Post("/add",
+                                httplib::Headers{{"Accept", "application/json, application/yaml"}},
+                                "a: 3\nb: 4\n",
+                                "application/yaml");
+    REQUIRE(rBothAccept);
+    CHECK(rBothAccept->status == 200);
+    CHECK(rBothAccept->get_header_value("Content-Type") == "application/json");
+    CHECK(rBothAccept->body == R"({"sum":7})");
+
+    // BOM + whitespace + '{' with non-explicit Content-Type -> JSON
+    auto rBomJson = tcp.Post("/add", "\xEF\xBB\xBF  {\"a\":4,\"b\":6}", "application/x-www-form-urlencoded");
+    REQUIRE(rBomJson);
+    CHECK(rBomJson->status == 200);
+    CHECK(rBomJson->get_header_value("Content-Type") == "application/json");
+    CHECK(rBomJson->body == R"({"sum":10})");
+
+    // Leading '{' failing JSON falls back to YAML
+    auto rFallback = tcp.Post("/add", "{a: 1, b: 2}", "application/x-www-form-urlencoded");
+    REQUIRE(rFallback);
+    CHECK(rFallback->status == 200);
+    CHECK(rFallback->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rFallback->body == R"(yaml:{"sum":3})");
+
+    // Leading '{' failing both reports JSON error
+    auto rBothFail = tcp.Post("/add", "{bad", "text/plain");
+    REQUIRE(rBothFail);
+    CHECK(rBothFail->status == 400);
+    CHECK(rBothFail->get_header_value("Content-Type") == "application/json");
+    CHECK(rBothFail->body.find("invalid_json") != std::string::npos);
+
+    // Non-'{'/'[' with BOM falls through to YAML (and YAML error on failure)
+    auto rBomYaml = tcp.Post("/add", "\xEF\xBB\xBF  a: 3\nb: 4\n", "application/x-www-form-urlencoded");
+    REQUIRE(rBomYaml);
+    CHECK(rBomYaml->status == 200);
+    CHECK(rBomYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rBomYaml->body == R"(yaml:{"sum":7})");
+
+    auto rBadYaml = tcp.Post("/add", "not_valid: [", "text/plain");
+    REQUIRE(rBadYaml);
+    CHECK(rBadYaml->status == 400);
+    CHECK(rBadYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rBadYaml->body.find("invalid_yaml") != std::string::npos);
+
+    // /openapi.json includes YAML note
+    auto oa = tcp.Get("/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 200);
+    auto spec = slimr::parse_json<slimr::Json>(oa->body);
+    REQUIRE(spec.has_value());
+    CHECK((*spec)["info"]["description"].get<std::string>() ==
+          "Endpoints also accept and return application/yaml.");
+
+    srv.stop();
 }

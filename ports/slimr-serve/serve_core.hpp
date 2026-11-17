@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -348,7 +349,6 @@ struct RequestContext {
     std::optional<std::string> minLogLevel;
     std::optional<Json> inputResponses;
     std::optional<std::string> requestState;
-    std::optional<std::string> session;
     Principal principal;
     CancellationToken cancellation;
     std::shared_ptr<NotificationChannel> notificationChannel;
@@ -492,7 +492,6 @@ struct ToolAnnotations {
 struct ToolOptions {
     ToolAnnotations annotations;
     bool threadSafe{false};
-    bool runsLocal{false};
     std::vector<std::string> requiredScopes;
 };
 
@@ -501,7 +500,6 @@ struct ToolDef {
     std::string description;
     ToolAnnotations annotations;
     bool threadSafe{false};
-    bool runsLocal{false};
     std::vector<std::string> requiredScopes;
     Json inputSchema;
     std::optional<Json> outputSchema;
@@ -518,16 +516,23 @@ struct RequiredEnvVar {
     std::string purpose;
 };
 
+/** Optional YAML parser/emitter callbacks attached by slimr::enable_yaml(opts). */
+struct YamlCodec {
+    std::function<std::expected<Json, std::string>(std::string_view)> parse;
+    std::function<std::string(const Json &)> emit;
+};
+
 struct OpenApiOptions {
     bool oauthEnabled{false};
+    bool yamlEnabled{false};
     std::string serverUrl;
+    std::string pathPrefix;
 };
 
 class ServeApp {
   public:
     using AuthorizerFn = std::function<bool(const Principal &, std::string_view operation, std::string &outError)>;
     using HttpRunnerFn = std::function<int(ServeApp &, int argc, char **argv)>;
-    using RemoteRelayFn = std::function<int(ServeApp &, const ToolDef &, const Json &args, const RequestContext &ctx, int argc, char **argv)>;
 
     std::string key;
     std::string version = "1.0.0";
@@ -539,11 +544,7 @@ class ServeApp {
     std::vector<std::string> defaultRequiredScopes;
     std::vector<std::string> localScopes{"*"};
     AuthorizerFn authorizer;
-    bool allowCliTools{true};
     int apiVersion{0};
-    std::string remote;
-    std::string remoteEnvVar;
-    OpenApiOptions openApiDefaults{};
     std::function<void(std::stop_token)> onServe;
 
     ServeApp() : runtime_(std::make_shared<RuntimeState>()) {}
@@ -576,14 +577,6 @@ class ServeApp {
 
     const HttpRunnerFn &httpRunner() const noexcept { return httpRunner_; }
 
-    void setRemoteRelay(RemoteRelayFn relay) {
-        remoteRelay_ = std::move(relay);
-    }
-
-    bool hasRemoteRelay() const noexcept { return static_cast<bool>(remoteRelay_); }
-
-    const RemoteRelayFn &remoteRelay() const noexcept { return remoteRelay_; }
-
     ServeApp &requireEnv(std::string name, std::string purpose) {
         requiredEnvVars.push_back(RequiredEnvVar{std::move(name), std::move(purpose)});
         return *this;
@@ -596,7 +589,6 @@ class ServeApp {
         def.description = std::move(desc);
         def.annotations = std::move(opts.annotations);
         def.threadSafe = opts.threadSafe;
-        def.runsLocal = opts.runsLocal;
         def.requiredScopes = std::move(opts.requiredScopes);
         def.inputSchema = schema<InputStruct>();
 
@@ -733,7 +725,6 @@ class ServeApp {
     std::map<std::string, ToolDef> tools_;
     std::shared_ptr<RuntimeState> runtime_;
     HttpRunnerFn httpRunner_;
-    RemoteRelayFn remoteRelay_;
 };
 
 /** Generates an OpenAPI 3.1.0 document from ServeApp's registered tools and auth configuration. */
@@ -744,8 +735,14 @@ inline Json build_openapi_spec(const ServeApp &app, const OpenApiOptions &opts =
     Json info = json_obj();
     info["title"] = app.key.empty() ? "app" : app.key;
     info["version"] = app.version.empty() ? "1.0.0" : app.version;
-    if (!app.description.empty()) {
-        info["description"] = app.description;
+    std::string infoDesc = app.description;
+    if (opts.yamlEnabled) {
+        if (!infoDesc.empty())
+            infoDesc += "\n\n";
+        infoDesc += "Endpoints also accept and return application/yaml.";
+    }
+    if (!infoDesc.empty()) {
+        info["description"] = std::move(infoDesc);
     }
     if (app.apiVersion > 0) {
         info["x-slimr-api-version"] = app.apiVersion;
@@ -855,7 +852,7 @@ inline Json build_openapi_spec(const ServeApp &app, const OpenApiOptions &opts =
 
         Json pathItem = json_obj();
         pathItem["post"] = std::move(postOp);
-        paths["/" + def.name] = std::move(pathItem);
+        paths[opts.pathPrefix + "/" + def.name] = std::move(pathItem);
     }
     spec["paths"] = std::move(paths);
 

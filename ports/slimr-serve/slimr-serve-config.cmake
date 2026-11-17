@@ -18,3 +18,12 @@ if(TARGET httplib::httplib AND NOT TARGET slimr::serve_http)
         INTERFACE_COMPILE_FEATURES cxx_std_26
         INTERFACE_LINK_LIBRARIES "slimr::serve;httplib::httplib")
 endif()
+
+find_package(slimr-yaml CONFIG QUIET)
+if(TARGET slimr::serve_http AND TARGET slimr::yaml AND NOT TARGET slimr::serve_yaml)
+    add_library(slimr::serve_yaml INTERFACE IMPORTED)
+    set_target_properties(slimr::serve_yaml PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include"
+        INTERFACE_COMPILE_FEATURES cxx_std_26
+        INTERFACE_LINK_LIBRARIES "slimr::serve_http;slimr::yaml")
+endif()

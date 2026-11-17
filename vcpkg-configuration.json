@@ -35,6 +35,14 @@
       "packages": [
         "slimr-bugsink"
       ]
+    },
+    {
+      "kind": "git",
+      "baseline": "5e1b7b6ef4cca116805f73541a7b52ffd02824cc",
+      "repository": "https://github.com/slimr-down-now/yaml",
+      "packages": [
+        "slimr-yaml"
+      ]
     }
   ]
 }
