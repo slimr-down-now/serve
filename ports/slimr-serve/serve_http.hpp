@@ -1,7 +1,6 @@
 #pragma once
 #include "serve.hpp"
 #include "serve_daemon.hpp"
-#include "serve_relay.hpp"
 
 #include <httplib.h>
 
@@ -165,7 +164,9 @@ struct ServeHttpOptions {
     int keepaliveTimeoutMs{30000};
     OAuthResourceConfig oauth;
     std::vector<CustomHttpRoute> customRoutes;
-    std::string socketPath; // Unix socket listener when set
+    bool toolRoutes{true};
+    std::string toolsPrefix; // Route prefix for /schema, /openapi.json, /:tool (no trailing '/'; empty = root)
+    std::string socketPath;  // Unix socket listener when set
     mode_t socketMode{0600};
     std::string socketGroup;
 };
@@ -356,66 +357,78 @@ class ServeHttpServer {
         svr.Delete("/health", methodNotAllowedGet);
         svr.Patch("/health", methodNotAllowedGet);
 
-        svr.Get("/schema", [this](const httplib::Request &, httplib::Response &res) {
-            Json toolsObj = json_obj();
-            for (const auto &[tName, def] : app_.tools()) {
-                Json entry = json_obj();
-                entry["name"] = def.name;
-                entry["description"] = def.description;
-                entry["inputSchema"] = def.inputSchema;
-                if (def.outputSchema.has_value())
-                    entry["outputSchema"] = *def.outputSchema;
-                Json ann = def.annotations.toJson();
-                if (!ann.empty())
-                    entry["annotations"] = std::move(ann);
-                entry["runsLocal"] = def.runsLocal;
-                entry["threadSafe"] = def.threadSafe;
-                toolsObj[tName] = std::move(entry);
-            }
-            Json body = json_obj();
-            body["name"] = app_.key;
-            body["version"] = app_.version;
-            body["apiVersion"] = app_.apiVersion;
-            body["tools"] = std::move(toolsObj);
-            sendJsonText(res, 200, slimr::write_json(body));
-        });
-        svr.Post("/schema", methodNotAllowedGet);
-        svr.Put("/schema", methodNotAllowedGet);
-        svr.Delete("/schema", methodNotAllowedGet);
-        svr.Patch("/schema", methodNotAllowedGet);
+        if (opts_.toolRoutes) {
+            std::string prefix = opts_.toolsPrefix;
+            while (prefix.size() > 1 && prefix.back() == '/')
+                prefix.pop_back();
+            if (prefix == "/")
+                prefix.clear();
 
-        svr.Get("/openapi.json", [this](const httplib::Request &, httplib::Response &res) {
-            OpenApiOptions oaOpts{
-                .oauthEnabled = opts_.oauth.enabled,
-                .serverUrl = (opts_.port.has_value() || !opts_.publicBaseUrl.empty()) ? baseUrl() : std::string{},
+            const std::string schemaPath = prefix + "/schema";
+            const std::string openApiPath = prefix + "/openapi.json";
+            const std::string toolPath = prefix + "/:tool";
+
+            svr.Get(schemaPath, [this](const httplib::Request &, httplib::Response &res) {
+                Json toolsObj = json_obj();
+                for (const auto &[tName, def] : app_.tools()) {
+                    Json entry = json_obj();
+                    entry["name"] = def.name;
+                    entry["description"] = def.description;
+                    entry["inputSchema"] = def.inputSchema;
+                    if (def.outputSchema.has_value())
+                        entry["outputSchema"] = *def.outputSchema;
+                    Json ann = def.annotations.toJson();
+                    if (!ann.empty())
+                        entry["annotations"] = std::move(ann);
+                    entry["threadSafe"] = def.threadSafe;
+                    toolsObj[tName] = std::move(entry);
+                }
+                Json body = json_obj();
+                body["name"] = app_.key;
+                body["version"] = app_.version;
+                body["apiVersion"] = app_.apiVersion;
+                body["tools"] = std::move(toolsObj);
+                sendJsonText(res, 200, slimr::write_json(body));
+            });
+            svr.Post(schemaPath, methodNotAllowedGet);
+            svr.Put(schemaPath, methodNotAllowedGet);
+            svr.Delete(schemaPath, methodNotAllowedGet);
+            svr.Patch(schemaPath, methodNotAllowedGet);
+
+            svr.Get(openApiPath, [this, prefix](const httplib::Request &, httplib::Response &res) {
+                OpenApiOptions oaOpts{
+                    .oauthEnabled = opts_.oauth.enabled,
+                    .serverUrl = (opts_.port.has_value() || !opts_.publicBaseUrl.empty()) ? baseUrl() : std::string{},
+                    .pathPrefix = prefix,
+                };
+                sendJsonText(res, 200, slimr::write_json(build_openapi_spec(app_, oaOpts)));
+            });
+            svr.Post(openApiPath, methodNotAllowedGet);
+            svr.Put(openApiPath, methodNotAllowedGet);
+            svr.Delete(openApiPath, methodNotAllowedGet);
+            svr.Patch(openApiPath, methodNotAllowedGet);
+
+            svr.Post(toolPath, [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
+                try {
+                    handleToolPost(req, res, watcher, isUnixSocket);
+                } catch (const std::exception &e) {
+                    Json err = json_obj();
+                    err["error"] = "internal_error";
+                    err["message"] = redact_sensitive(e.what());
+                    sendJsonText(res, 500, slimr::write_json(err));
+                } catch (...) {
+                    sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
+                }
+            });
+            auto methodNotAllowedPost = [](const httplib::Request &, httplib::Response &res) {
+                sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
+                             {{"Allow", "POST"}});
             };
-            sendJsonText(res, 200, slimr::write_json(build_openapi_spec(app_, oaOpts)));
-        });
-        svr.Post("/openapi.json", methodNotAllowedGet);
-        svr.Put("/openapi.json", methodNotAllowedGet);
-        svr.Delete("/openapi.json", methodNotAllowedGet);
-        svr.Patch("/openapi.json", methodNotAllowedGet);
-
-        svr.Post("/:tool", [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
-            try {
-                handleToolPost(req, res, watcher, isUnixSocket);
-            } catch (const std::exception &e) {
-                Json err = json_obj();
-                err["error"] = "internal_error";
-                err["message"] = redact_sensitive(e.what());
-                sendJsonText(res, 500, slimr::write_json(err));
-            } catch (...) {
-                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
-            }
-        });
-        auto methodNotAllowedPost = [](const httplib::Request &, httplib::Response &res) {
-            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
-                         {{"Allow", "POST"}});
-        };
-        svr.Get("/:tool", methodNotAllowedPost);
-        svr.Put("/:tool", methodNotAllowedPost);
-        svr.Delete("/:tool", methodNotAllowedPost);
-        svr.Patch("/:tool", methodNotAllowedPost);
+            svr.Get(toolPath, methodNotAllowedPost);
+            svr.Put(toolPath, methodNotAllowedPost);
+            svr.Delete(toolPath, methodNotAllowedPost);
+            svr.Patch(toolPath, methodNotAllowedPost);
+        }
     }
 
     static void sendResponse(httplib::Response &res,
@@ -579,7 +592,9 @@ class ServeHttpServer {
         if (isUnixSocket) {
             principal = local_principal(app_);
         } else if (opts_.oauth.enabled) {
-            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, baseUrl(), routeReq);
+            const std::string expectedRes =
+                opts_.oauth.expectedResource.empty() ? baseUrl() : opts_.oauth.expectedResource;
+            auto authRes = serve_detail::evaluate_bearer_auth(opts_.oauth, expectedRes, routeReq);
             if (authRes.status == TokenValidationResult::Status::InvalidToken) {
                 sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription);
                 return;
@@ -622,31 +637,9 @@ class ServeHttpServer {
             parsedBody = std::move(*parsed);
         }
 
-        Json args = parsedBody;
+        Json args = std::move(parsedBody);
         RequestContext ctx;
         ctx.principal = std::move(principal);
-        bool hasInputSchemaProp = def->inputSchema.contains("properties") &&
-                                  def->inputSchema["properties"].is_object() &&
-                                  def->inputSchema["properties"].contains("input");
-        bool isEnvelope = parsedBody.contains("input") &&
-                          (parsedBody.contains("context") || (parsedBody.size() == 1 && !hasInputSchemaProp));
-        if (isEnvelope) {
-            if (!parsedBody["input"].is_object()) {
-                sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Envelope 'input' must be a JSON object\"}");
-                return;
-            }
-            args = parsedBody["input"];
-            if (parsedBody.contains("context")) {
-                if (!parsedBody["context"].is_object()) {
-                    sendJsonText(res, 400, "{\"error\":\"invalid_params\",\"message\":\"Envelope 'context' must be a JSON object\"}");
-                    return;
-                }
-                const Json &c = parsedBody["context"];
-                if (c.contains("session") && c["session"].is_string()) {
-                    ctx.session = c["session"].get<std::string>();
-                }
-            }
-        }
 
         bool wantNdjson = req.has_header("Accept") &&
                           serve_detail::accepts_ndjson(req.get_header_value("Accept"));
@@ -846,10 +839,8 @@ class ServeHttpServer {
     std::atomic<uint16_t> boundPort_{0};
 };
 
-/** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags and CLI remote relay to ServeApp. */
+/** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags to ServeApp. */
 inline void enable_serve(ServeApp &app, ServeHttpOptions defaults = {}) {
-    enable_cli_relay(app);
-    app.openApiDefaults.oauthEnabled = defaults.oauth.enabled;
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &target, int argc, char **argv) -> int {
         ServeHttpOptions opts = defaults;
         std::string prog = target.key.empty() ? "app" : target.key;

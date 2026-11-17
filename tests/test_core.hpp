@@ -20,7 +20,7 @@ TEST_CASE("[core] typed handler registration generates inputSchema and outputSch
     app.tool<serve_core_test::AddInput>(
         "add",
         "Add two numbers",
-        slimr::ToolOptions{.annotations = {.readOnlyHint = true}, .threadSafe = true, .runsLocal = true},
+        slimr::ToolOptions{.annotations = {.readOnlyHint = true}, .threadSafe = true},
         [](const serve_core_test::AddInput &in) {
             return serve_core_test::AddOutput{.sum = in.a.value + in.b.value};
         });
@@ -28,7 +28,6 @@ TEST_CASE("[core] typed handler registration generates inputSchema and outputSch
     const auto *def = app.findTool("add");
     REQUIRE(def != nullptr);
     CHECK(def->threadSafe);
-    CHECK(def->runsLocal);
     CHECK(def->inputSchema.contains("properties"));
     CHECK(def->inputSchema["properties"].contains("a"));
     REQUIRE(def->outputSchema.has_value());
@@ -39,7 +38,6 @@ TEST_CASE("[core] typed handler registration generates inputSchema and outputSch
     }
 
     slimr::RequestContext ctx;
-    ctx.session = "sess-1";
     slimr::Json args = slimr::json_obj();
     args["a"] = 2;
     args["b"] = 3;
@@ -140,8 +138,6 @@ TEST_CASE("[core] RequestContext emits progress and filtered log events") {
 TEST_CASE("[core] RequiredEnvVar and ServeApp metadata") {
     slimr::ServeApp app("demo", "2.0.0");
     app.apiVersion = 3;
-    app.remote = "unix:/tmp/demo.sock";
-    app.remoteEnvVar = "DEMO_REMOTE";
     app.requireEnv("DEMO_KEY", "API key");
     CHECK(app.apiVersion == 3);
     CHECK(app.localScopes == std::vector<std::string>{"*"});
@@ -222,4 +218,9 @@ TEST_CASE("[core] build_openapi_spec generates OpenAPI 3.1.0 with schemas, serve
     auto authzSpec = slimr::build_openapi_spec(app);
     CHECK(authzSpec["paths"]["/add"]["post"]["responses"].contains("401"));
     CHECK(authzSpec["paths"]["/add"]["post"]["responses"].contains("403"));
+
+    auto prefixedSpec = slimr::build_openapi_spec(app, slimr::OpenApiOptions{.pathPrefix = "/tools"});
+    CHECK(prefixedSpec["paths"].contains("/tools/add"));
+    CHECK(prefixedSpec["paths"].contains("/tools/ping"));
+    CHECK_FALSE(prefixedSpec["paths"].contains("/add"));
 }

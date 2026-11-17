@@ -1,7 +1,7 @@
 {
   "name": "slimr-serve",
   "version": "0.3.0",
-  "description": "Header-only typed tool servers and JSON CLIs",
+  "description": "Header-only typed tool servers",
   "dependencies": [
     {
       "name": "slimr-bugsink",

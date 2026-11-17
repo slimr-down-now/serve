@@ -1,6 +1,6 @@
 # slimr-serve
 
-Header-only typed tool servers and JSON CLIs
+Header-only typed tool servers
 
 <!-- cpp-templates:begin -->
 <!-- cpp-templates:commit c746b02c9f5b17b63c4921e6adff7fa8c5f6dc37 -->
