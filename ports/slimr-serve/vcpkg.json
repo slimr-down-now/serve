@@ -28,6 +28,22 @@
           ]
         }
       ]
+    },
+    "yaml": {
+      "description": "Opt-in YAML request/response body support via slimr-yaml",
+      "dependencies": [
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        },
+        {
+          "name": "slimr-yaml",
+          "version>=": "0.1.1"
+        }
+      ]
     }
   }
 }

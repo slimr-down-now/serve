@@ -41,6 +41,10 @@
         {
           "name": "slimr-test",
           "version>=": "0.1.1"
+        },
+        {
+          "name": "slimr-yaml",
+          "version>=": "0.1.1"
         }
       ]
     }

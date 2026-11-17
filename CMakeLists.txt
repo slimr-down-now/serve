@@ -75,8 +75,10 @@ if(BUILD_TESTING)
     if(NOT TARGET httplib::httplib)
         message(FATAL_ERROR "Serve HTTP tests require httplib::httplib target")
     endif()
+    find_package(slimr-yaml CONFIG REQUIRED)
 else()
     find_package(httplib CONFIG QUIET)
+    find_package(slimr-yaml CONFIG QUIET)
 endif()
 
 add_library(slimr_serve INTERFACE)
@@ -89,6 +91,12 @@ if(TARGET httplib::httplib)
     add_library(slimr::serve_http ALIAS slimr_serve_http)
     target_compile_features(slimr_serve_http INTERFACE cxx_std_26)
     target_link_libraries(slimr_serve_http INTERFACE slimr::serve httplib::httplib)
+    if(TARGET slimr::yaml)
+        add_library(slimr_serve_yaml INTERFACE)
+        add_library(slimr::serve_yaml ALIAS slimr_serve_yaml)
+        target_compile_features(slimr_serve_yaml INTERFACE cxx_std_26)
+        target_link_libraries(slimr_serve_yaml INTERFACE slimr::serve_http slimr::yaml)
+    endif()
 endif()
 
 if(BUILD_TESTING)
@@ -102,6 +110,14 @@ if(BUILD_TESTING)
     set_target_properties(slimr-serve_test PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
     add_test(NAME slimr-serve COMMAND slimr-serve_test)
     set_tests_properties(slimr-serve PROPERTIES TIMEOUT 120
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        ENVIRONMENT "BUGSINK_DSN=;TMPDIR=${CMAKE_BINARY_DIR}")
+
+    add_executable(slimr-serve_yaml_test tests/test_yaml_main.cpp)
+    target_link_libraries(slimr-serve_yaml_test PRIVATE slimr::serve_yaml slimr::test app_options)
+    set_target_properties(slimr-serve_yaml_test PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    add_test(NAME slimr-serve_yaml COMMAND slimr-serve_yaml_test)
+    set_tests_properties(slimr-serve_yaml PROPERTIES TIMEOUT 120
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         ENVIRONMENT "BUGSINK_DSN=;TMPDIR=${CMAKE_BINARY_DIR}")
 endif()

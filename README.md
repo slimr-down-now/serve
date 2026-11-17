@@ -17,13 +17,15 @@ Add `slimr-down-now/serve` to `vcpkg-configuration.json`:
 }
 ```
 
-Declare `slimr-serve` in `vcpkg.json` (add the `"http"` feature for `ServeHttpServer` and `DaemonServer`) and link `slimr::serve` / `slimr::serve_http` in `CMakeLists.txt`:
+Declare `slimr-serve` in `vcpkg.json` (add the `"http"` feature for `ServeHttpServer` and `DaemonServer`, or `"yaml"` for opt-in YAML request/response bodies) and link `slimr::serve` / `slimr::serve_http` / `slimr::serve_yaml` in `CMakeLists.txt`:
 
 ```cmake
 find_package(slimr-serve CONFIG REQUIRED)
 target_link_libraries(my_target PRIVATE slimr::serve)
 # With the "http" feature enabled:
 target_link_libraries(my_target PRIVATE slimr::serve_http)
+# With the "yaml" feature enabled (link only into final executables; see below):
+target_link_libraries(my_executable PRIVATE slimr::serve_yaml)
 ```
 
 ## Usage
@@ -81,6 +83,24 @@ curl -sS --unix-socket /path/run/calc.sock -X POST http://localhost/add -H 'Cont
 Flags override the defaults passed to `enable_serve` (`.host`, `.port`, `.socketPath`, `.socketMode`, `.socketGroup`). TCP evaluates bearer/OAuth when `oauth.enabled`; the socket runs as the local principal (`app.localScopes`) with no OAuth. Both go through the same scope checks and `app.authorizer`. A second `serve` on the same socket exits 1 (`flock` on `<socket>.lock`); a stale socket file is replaced and the socket is unlinked on stop.
 
 `app.onServe` runs on its own thread once the listeners are up. On SIGINT/SIGTERM its `std::stop_token` is signaled before in-flight calls drain, then the thread is joined. An exception escaping `onServe` is reported (redacted, to stderr and Bugsink) and shuts the server down with exit 1.
+
+### Opt-in YAML (`"yaml"` feature)
+
+Enable the `"yaml"` feature in `vcpkg.json`, link `slimr::serve_yaml` into your final executable, and call `slimr::enable_yaml(opts)` from `<serve_yaml.hpp>`:
+
+```cpp
+#include <serve_yaml.hpp>
+
+slimr::ServeHttpOptions opts;
+opts.host = "127.0.0.1";
+opts.port = 10001;
+slimr::enable_yaml(opts);
+```
+
+- **Explicit `Content-Type` vs detection**: `Content-Type: application/json` parses strictly as JSON; `Content-Type: application/yaml` parses as YAML. Any other or missing `Content-Type` (including `curl -d`'s default `application/x-www-form-urlencoded`) skips leading UTF-8 BOM and whitespace, tries JSON with YAML fallback when the first character is `{` or `[` (reporting the JSON error if both fail), and parses as YAML otherwise.
+- **`Accept` precedence**: `Accept: application/x-ndjson` streams NDJSON (JSON lines) first; otherwise `application/json` or `application/yaml` in `Accept` wins (JSON wins if both appear); otherwise responses and errors mirror the detected input format.
+- **OpenAPI**: `/openapi.json`, `/schema`, and `/health` stay JSON; `/openapi.json` appends `"Endpoints also accept and return application/yaml."` to `info.description`.
+- **Link rule (`INTERFACE_SOURCES`)**: `slimr::serve_yaml` links `slimr::yaml`, which compiles rapidyaml via `INTERFACE_SOURCES`. Link `slimr::serve_yaml` only into final executables, never into `slimr::serve_http` or intermediate static libraries, to avoid duplicate symbols.
 
 ## Build & Test
 
