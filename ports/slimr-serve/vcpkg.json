@@ -1,6 +1,6 @@
 {
   "name": "slimr-serve",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Header-only typed tool servers and JSON CLIs",
   "dependencies": [
     {
