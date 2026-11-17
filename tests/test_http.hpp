@@ -724,3 +724,69 @@ TEST_CASE("[http] serve rejects bad socket flags and requires a listener") {
     CHECK(serve_http_test::run_serve(app, {"flags", "http", "--host", "localhost"}) == 2);
     CHECK(serve_http_test::run_serve(app, {"flags", "serve"}) == 1);
 }
+
+TEST_CASE("[http] GET /openapi.json serves unauthenticated OpenAPI 3.1.0 and 405s other methods") {
+    slimr::ServeApp app("oa-http", "1.0.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    // TCP with OAuth enabled: GET /openapi.json is unauthenticated and includes servers[0].url + bearerAuth
+    {
+        slimr::ServeHttpOptions opts;
+        opts.host = "127.0.0.1";
+        opts.port = 0;
+        opts.oauth.enabled = true;
+        opts.oauth.validateToken = [](const slimr::TokenValidationContext &) {
+            return slimr::TokenValidationResult{};
+        };
+        slimr::enable_serve(app, opts);
+        CHECK(app.openApiDefaults.oauthEnabled);
+
+        slimr::ServeHttpServer srv(app, opts);
+        REQUIRE(srv.start());
+        httplib::Client tcp("127.0.0.1", srv.boundPort());
+
+        auto getRes = tcp.Get("/openapi.json");
+        REQUIRE(getRes);
+        CHECK(getRes->status == 200);
+        auto spec = slimr::parse_json<slimr::Json>(getRes->body);
+        REQUIRE(spec.has_value());
+        CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+        CHECK((*spec)["servers"][0]["url"].get<std::string>() == srv.baseUrl());
+        CHECK((*spec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
+        CHECK((*spec)["paths"]["/add"]["post"]["responses"].contains("401"));
+
+        auto check405 = [](const httplib::Result &res) {
+            REQUIRE(res);
+            CHECK(res->status == 405);
+            CHECK(res->get_header_value("Allow") == "GET");
+        };
+        check405(tcp.Post("/openapi.json", "{}", "application/json"));
+        check405(tcp.Put("/openapi.json", "{}", "application/json"));
+        check405(tcp.Delete("/openapi.json"));
+        check405(tcp.Patch("/openapi.json", "{}", "application/json"));
+        srv.stop();
+    }
+
+    // Unix-socket-only server omits servers
+    {
+        serve_daemon_server_test::TempDirGuard tmp("oa-sock");
+        auto sockPath = (tmp.dir / "oa.sock").string();
+        slimr::ServeHttpOptions opts;
+        opts.socketPath = sockPath;
+        slimr::ServeHttpServer srv(app, opts);
+        REQUIRE(srv.start());
+        auto sock = serve_http_test::unix_client(sockPath);
+
+        auto getRes = sock.Get("/openapi.json");
+        REQUIRE(getRes);
+        CHECK(getRes->status == 200);
+        auto spec = slimr::parse_json<slimr::Json>(getRes->body);
+        REQUIRE(spec.has_value());
+        CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+        CHECK_FALSE(spec->contains("servers"));
+        CHECK((*spec)["paths"].contains("/add"));
+        srv.stop();
+    }
+}

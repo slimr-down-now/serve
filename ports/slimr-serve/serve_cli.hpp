@@ -206,7 +206,7 @@ inline void print_cli_help(const ServeApp &app, std::ostream &os = std::cout) {
     if (app.allowCliTools) {
         os << "  " << prog << " [--skip-checks] [--remote <target>] <tool> ['{\"arg\":\"val\"}'|@path|-]\n";
     }
-    os << "  " << prog << " --version | --help\n\n";
+    os << "  " << prog << " --openapi | --version | --help\n\n";
     os << "Available tools:\n";
     for (const auto &[name, def] : app.tools()) {
         (void)name;
@@ -272,6 +272,11 @@ inline int run_cli(ServeApp &app,
 
     if (fArgc == 2 && std::strcmp(filteredArgv[1], "--version") == 0) {
         out << (app.key.empty() ? "app" : app.key) << " " << app.version << "\n";
+        return 0;
+    }
+
+    if (fArgc == 2 && std::strcmp(filteredArgv[1], "--openapi") == 0) {
+        out << slimr::write_json(build_openapi_spec(app, OpenApiOptions{.oauthEnabled = app.openApiDefaults.oauthEnabled})) << "\n";
         return 0;
     }
 

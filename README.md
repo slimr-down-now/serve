@@ -53,7 +53,9 @@ int main(int argc, char **argv) {
 
 ### Serving
 
-`calc serve` (alias `calc http`) serves the same routes on every listener: `POST /<tool>` (JSON, or NDJSON progress when `Accept: application/x-ndjson`), `GET /schema`, `GET /health`, plus any `customRoutes` registered first. Each listener is opt-in; with neither configured, `serve` exits 1.
+`calc serve` (alias `calc http`) serves the same routes on every listener: `POST /<tool>` (JSON, or NDJSON progress when `Accept: application/x-ndjson`), `GET /openapi.json` (OpenAPI 3.1.0), `GET /schema`, `GET /health`, plus any `customRoutes` registered first. Each listener is opt-in; with neither configured, `serve` exits 1.
+
+`calc --openapi` dumps the OpenAPI 3.1.0 document to stdout without requiring `allowCliTools` or runtime env vars.
 
 ```bash
 calc serve --host 127.0.0.1 --port 0              # TCP; port 0 binds an ephemeral port and logs the URL

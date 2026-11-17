@@ -348,3 +348,37 @@ TEST_CASE("[cli] serve and http subcommands delegate to httpRunner") {
         CHECK(seenSubcmd == "http");
     }
 }
+
+TEST_CASE("[cli] --openapi dumps OpenAPI 3.1.0 before env and allowCliTools gates") {
+    slimr::ServeApp app("oa-cli", "1.5.0");
+    app.allowCliTools = false;
+    app.requireEnv("SLIMR_SERVE_MISSING_OPENAPI_ENV", "Missing on purpose");
+    app.openApiDefaults.oauthEnabled = true;
+    app.tool<serve_cli_test::EchoInput>("echo", "Echo message", [](const serve_cli_test::EchoInput &in) {
+        return serve_cli_test::EchoOutput{.echoed = in.msg.value};
+    });
+
+    {
+        serve_cli_test::ArgvBuilder args{"oa-cli", "--help"};
+        std::ostringstream out, err;
+        std::istringstream in;
+        CHECK(slimr::run_cli(app, args.argc(), args.argv(), out, err, in) == 0);
+        CHECK(out.str().find("--openapi") != std::string::npos);
+    }
+
+    {
+        serve_cli_test::ArgvBuilder args{"oa-cli", "--openapi"};
+        std::ostringstream out, err;
+        std::istringstream in;
+        CHECK(slimr::run_cli(app, args.argc(), args.argv(), out, err, in) == 0);
+        CHECK(err.str().empty());
+        auto spec = slimr::parse_json<slimr::Json>(out.str());
+        REQUIRE(spec.has_value());
+        CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+        CHECK((*spec)["info"]["title"].get<std::string>() == "oa-cli");
+        CHECK((*spec)["info"]["version"].get<std::string>() == "1.5.0");
+        CHECK_FALSE(spec->contains("servers"));
+        CHECK((*spec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
+        CHECK((*spec)["paths"].contains("/echo"));
+    }
+}

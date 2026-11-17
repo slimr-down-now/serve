@@ -384,6 +384,18 @@ class ServeHttpServer {
         svr.Delete("/schema", methodNotAllowedGet);
         svr.Patch("/schema", methodNotAllowedGet);
 
+        svr.Get("/openapi.json", [this](const httplib::Request &, httplib::Response &res) {
+            OpenApiOptions oaOpts{
+                .oauthEnabled = opts_.oauth.enabled,
+                .serverUrl = (opts_.port.has_value() || !opts_.publicBaseUrl.empty()) ? baseUrl() : std::string{},
+            };
+            sendJsonText(res, 200, slimr::write_json(build_openapi_spec(app_, oaOpts)));
+        });
+        svr.Post("/openapi.json", methodNotAllowedGet);
+        svr.Put("/openapi.json", methodNotAllowedGet);
+        svr.Delete("/openapi.json", methodNotAllowedGet);
+        svr.Patch("/openapi.json", methodNotAllowedGet);
+
         svr.Post("/:tool", [this, &watcher, isUnixSocket](const httplib::Request &req, httplib::Response &res) {
             try {
                 handleToolPost(req, res, watcher, isUnixSocket);
@@ -837,6 +849,7 @@ class ServeHttpServer {
 /** Attaches the `serve` subcommand (and `http` alias) with TCP/Unix socket flags and CLI remote relay to ServeApp. */
 inline void enable_serve(ServeApp &app, ServeHttpOptions defaults = {}) {
     enable_cli_relay(app);
+    app.openApiDefaults.oauthEnabled = defaults.oauth.enabled;
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &target, int argc, char **argv) -> int {
         ServeHttpOptions opts = defaults;
         std::string prog = target.key.empty() ? "app" : target.key;

@@ -518,6 +518,11 @@ struct RequiredEnvVar {
     std::string purpose;
 };
 
+struct OpenApiOptions {
+    bool oauthEnabled{false};
+    std::string serverUrl;
+};
+
 class ServeApp {
   public:
     using AuthorizerFn = std::function<bool(const Principal &, std::string_view operation, std::string &outError)>;
@@ -538,6 +543,7 @@ class ServeApp {
     int apiVersion{0};
     std::string remote;
     std::string remoteEnvVar;
+    OpenApiOptions openApiDefaults{};
     std::function<void(std::stop_token)> onServe;
 
     ServeApp() : runtime_(std::make_shared<RuntimeState>()) {}
@@ -729,5 +735,131 @@ class ServeApp {
     HttpRunnerFn httpRunner_;
     RemoteRelayFn remoteRelay_;
 };
+
+/** Generates an OpenAPI 3.1.0 document from ServeApp's registered tools and auth configuration. */
+inline Json build_openapi_spec(const ServeApp &app, const OpenApiOptions &opts = {}) {
+    Json spec = json_obj();
+    spec["openapi"] = "3.1.0";
+
+    Json info = json_obj();
+    info["title"] = app.key.empty() ? "app" : app.key;
+    info["version"] = app.version.empty() ? "1.0.0" : app.version;
+    if (!app.description.empty()) {
+        info["description"] = app.description;
+    }
+    if (app.apiVersion > 0) {
+        info["x-slimr-api-version"] = app.apiVersion;
+    }
+    spec["info"] = std::move(info);
+
+    if (!opts.serverUrl.empty()) {
+        Json serverEntry = json_obj();
+        serverEntry["url"] = opts.serverUrl;
+        Json::array_t servers;
+        servers.push_back(std::move(serverEntry));
+        spec["servers"] = std::move(servers);
+    }
+
+    Json strType = json_obj();
+    strType["type"] = "string";
+    Json intType = json_obj();
+    intType["type"] = "integer";
+
+    Json errProps = json_obj();
+    errProps["error"] = strType;
+    errProps["message"] = strType;
+    errProps["error_description"] = strType;
+    errProps["code"] = intType;
+    errProps["serverApiVersion"] = intType;
+    errProps["clientApiVersion"] = intType;
+
+    Json errSchema = json_obj();
+    errSchema["type"] = "object";
+    errSchema["required"] = Json::array_t{Json("error")};
+    errSchema["properties"] = std::move(errProps);
+
+    Json schemas = json_obj();
+    schemas["ErrorResponse"] = std::move(errSchema);
+
+    Json components = json_obj();
+    components["schemas"] = std::move(schemas);
+
+    if (opts.oauthEnabled) {
+        Json bearer = json_obj();
+        bearer["type"] = "http";
+        bearer["scheme"] = "bearer";
+        Json secSchemes = json_obj();
+        secSchemes["bearerAuth"] = std::move(bearer);
+        components["securitySchemes"] = std::move(secSchemes);
+
+        Json secReq = json_obj();
+        secReq["bearerAuth"] = Json::array_t{};
+        Json::array_t secArr;
+        secArr.push_back(std::move(secReq));
+        spec["security"] = std::move(secArr);
+    }
+    spec["components"] = std::move(components);
+
+    auto makeErrorResponse = [](std::string_view desc) {
+        Json refObj = json_obj();
+        refObj["$ref"] = "#/components/schemas/ErrorResponse";
+        Json appJson = json_obj();
+        appJson["schema"] = std::move(refObj);
+        Json content = json_obj();
+        content["application/json"] = std::move(appJson);
+        Json resp = json_obj();
+        resp["description"] = std::string(desc);
+        resp["content"] = std::move(content);
+        return resp;
+    };
+
+    Json paths = json_obj();
+    for (const auto &[name, def] : app.tools()) {
+        (void)name;
+        Json postOp = json_obj();
+        postOp["operationId"] = def.name;
+        if (!def.description.empty()) {
+            postOp["description"] = def.description;
+        }
+
+        Json reqJson = json_obj();
+        reqJson["schema"] = def.inputSchema;
+        Json reqContent = json_obj();
+        reqContent["application/json"] = std::move(reqJson);
+        Json reqBody = json_obj();
+        reqBody["required"] = false;
+        reqBody["content"] = std::move(reqContent);
+        postOp["requestBody"] = std::move(reqBody);
+
+        Json okJson = json_obj();
+        okJson["schema"] = def.outputSchema.value_or(json_obj());
+        Json okContent = json_obj();
+        okContent["application/json"] = std::move(okJson);
+        Json okResp = json_obj();
+        okResp["description"] = "Tool result";
+        okResp["content"] = std::move(okContent);
+
+        Json responses = json_obj();
+        responses["200"] = std::move(okResp);
+        responses["400"] = makeErrorResponse("Bad request");
+        if (opts.oauthEnabled || app.authorizer || !app.defaultRequiredScopes.empty() || !def.requiredScopes.empty()) {
+            responses["401"] = makeErrorResponse("Unauthorized");
+            responses["403"] = makeErrorResponse("Forbidden");
+        }
+        responses["413"] = makeErrorResponse("Payload too large");
+        responses["415"] = makeErrorResponse("Unsupported media type");
+        responses["426"] = makeErrorResponse("Upgrade required");
+        responses["500"] = makeErrorResponse("Internal server error");
+        responses["503"] = makeErrorResponse("Service unavailable");
+        postOp["responses"] = std::move(responses);
+
+        Json pathItem = json_obj();
+        pathItem["post"] = std::move(postOp);
+        paths["/" + def.name] = std::move(pathItem);
+    }
+    spec["paths"] = std::move(paths);
+
+    return spec;
+}
 
 } // namespace slimr
