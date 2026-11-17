@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -515,8 +516,15 @@ struct RequiredEnvVar {
     std::string purpose;
 };
 
+/** Optional YAML parser/emitter callbacks attached by slimr::enable_yaml(opts). */
+struct YamlCodec {
+    std::function<std::expected<Json, std::string>(std::string_view)> parse;
+    std::function<std::string(const Json &)> emit;
+};
+
 struct OpenApiOptions {
     bool oauthEnabled{false};
+    bool yamlEnabled{false};
     std::string serverUrl;
     std::string pathPrefix;
 };
@@ -727,8 +735,14 @@ inline Json build_openapi_spec(const ServeApp &app, const OpenApiOptions &opts =
     Json info = json_obj();
     info["title"] = app.key.empty() ? "app" : app.key;
     info["version"] = app.version.empty() ? "1.0.0" : app.version;
-    if (!app.description.empty()) {
-        info["description"] = app.description;
+    std::string infoDesc = app.description;
+    if (opts.yamlEnabled) {
+        if (!infoDesc.empty())
+            infoDesc += "\n\n";
+        infoDesc += "Endpoints also accept and return application/yaml.";
+    }
+    if (!infoDesc.empty()) {
+        info["description"] = std::move(infoDesc);
     }
     if (app.apiVersion > 0) {
         info["x-slimr-api-version"] = app.apiVersion;

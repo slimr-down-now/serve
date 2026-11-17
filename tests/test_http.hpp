@@ -924,3 +924,164 @@ TEST_CASE("[http] oauth.expectedResource overrides baseUrl in validateToken") {
 
     srv.stop();
 }
+
+TEST_CASE("[http] non-opted ServeHttpServer rejects application/yaml, form-urlencoded, and missing Content-Type with 415") {
+    serve_daemon_server_test::TempDirGuard tmp("no-yaml");
+    auto sockPath = (tmp.dir / "no-yaml.sock").string();
+
+    slimr::ServeApp app("no-yaml", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.socketPath = sockPath;
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+
+    httplib::Client tcp("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
+
+    for (auto *c : {&tcp, &sock}) {
+        auto rYaml = c->Post("/add", "a: 1\nb: 2\n", "application/yaml");
+        REQUIRE(rYaml);
+        CHECK(rYaml->status == 415);
+
+        auto rForm = c->Post("/add", R"({"a":1,"b":2})", "application/x-www-form-urlencoded");
+        REQUIRE(rForm);
+        CHECK(rForm->status == 415);
+
+        // Post without Content-Type and non-empty body
+        httplib::Request rawReq;
+        rawReq.method = "POST";
+        rawReq.path = "/add";
+        rawReq.body = R"({"a":1,"b":2})";
+        auto rMissing = c->send(rawReq);
+        REQUIRE(rMissing);
+        CHECK(rMissing->status == 415);
+    }
+
+    auto oa = tcp.Get("/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 200);
+    auto spec = slimr::parse_json<slimr::Json>(oa->body);
+    REQUIRE(spec.has_value());
+    CHECK_FALSE((*spec)["info"].contains("description"));
+
+    srv.stop();
+}
+
+TEST_CASE("[http] ServeHttpOptions.yaml hook supports detection, fallback, Accept override, and OpenAPI note") {
+    serve_daemon_server_test::TempDirGuard tmp("yaml-hook");
+    auto sockPath = (tmp.dir / "yaml-hook.sock").string();
+
+    slimr::ServeApp app("yaml-hook", "0.1.0");
+    app.tool<serve_http_test::AddIn>("add", "Add", [](const serve_http_test::AddIn &in) {
+        return serve_http_test::AddOut{.sum = in.a.value + in.b.value};
+    });
+
+    slimr::ServeHttpOptions opts;
+    opts.port = 0;
+    opts.socketPath = sockPath;
+    opts.yaml = slimr::YamlCodec{
+        .parse = [](std::string_view sv) -> std::expected<slimr::Json, std::string> {
+            if (sv == "{a: 1, b: 2}") {
+                slimr::Json j = slimr::json_obj();
+                j["a"] = 1;
+                j["b"] = 2;
+                return j;
+            }
+            if (sv == "a: 3\nb: 4\n" || sv == "  a: 3\nb: 4\n") {
+                slimr::Json j = slimr::json_obj();
+                j["a"] = 3;
+                j["b"] = 4;
+                return j;
+            }
+            return std::unexpected("bad yaml");
+        },
+        .emit = [](const slimr::Json &j) -> std::string {
+            return "yaml:" + slimr::write_json(j);
+        },
+    };
+
+    slimr::ServeHttpServer srv(app, opts);
+    REQUIRE(srv.start());
+
+    httplib::Client tcp("127.0.0.1", srv.boundPort());
+    auto sock = serve_http_test::unix_client(sockPath);
+
+    // Explicit application/yaml over TCP and Unix socket -> YAML out
+    for (auto *c : {&tcp, &sock}) {
+        auto r = c->Post("/add", "a: 3\nb: 4\n", "application/yaml");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Content-Type") == "application/yaml");
+        CHECK(r->body == R"(yaml:{"sum":7})");
+    }
+
+    // Explicit application/json with Accept: application/yaml -> YAML out
+    auto rOverrideYaml = tcp.Post("/add",
+                                  httplib::Headers{{"Accept", "application/yaml"}},
+                                  R"({"a":2,"b":5})",
+                                  "application/json");
+    REQUIRE(rOverrideYaml);
+    CHECK(rOverrideYaml->status == 200);
+    CHECK(rOverrideYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rOverrideYaml->body == R"(yaml:{"sum":7})");
+
+    // Accept with both application/json and application/yaml -> JSON wins (Q2)
+    auto rBothAccept = tcp.Post("/add",
+                                httplib::Headers{{"Accept", "application/json, application/yaml"}},
+                                "a: 3\nb: 4\n",
+                                "application/yaml");
+    REQUIRE(rBothAccept);
+    CHECK(rBothAccept->status == 200);
+    CHECK(rBothAccept->get_header_value("Content-Type") == "application/json");
+    CHECK(rBothAccept->body == R"({"sum":7})");
+
+    // BOM + whitespace + '{' with non-explicit Content-Type -> JSON
+    auto rBomJson = tcp.Post("/add", "\xEF\xBB\xBF  {\"a\":4,\"b\":6}", "application/x-www-form-urlencoded");
+    REQUIRE(rBomJson);
+    CHECK(rBomJson->status == 200);
+    CHECK(rBomJson->get_header_value("Content-Type") == "application/json");
+    CHECK(rBomJson->body == R"({"sum":10})");
+
+    // Leading '{' failing JSON falls back to YAML
+    auto rFallback = tcp.Post("/add", "{a: 1, b: 2}", "application/x-www-form-urlencoded");
+    REQUIRE(rFallback);
+    CHECK(rFallback->status == 200);
+    CHECK(rFallback->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rFallback->body == R"(yaml:{"sum":3})");
+
+    // Leading '{' failing both reports JSON error
+    auto rBothFail = tcp.Post("/add", "{bad", "text/plain");
+    REQUIRE(rBothFail);
+    CHECK(rBothFail->status == 400);
+    CHECK(rBothFail->get_header_value("Content-Type") == "application/json");
+    CHECK(rBothFail->body.find("invalid_json") != std::string::npos);
+
+    // Non-'{'/'[' with BOM falls through to YAML (and YAML error on failure)
+    auto rBomYaml = tcp.Post("/add", "\xEF\xBB\xBF  a: 3\nb: 4\n", "application/x-www-form-urlencoded");
+    REQUIRE(rBomYaml);
+    CHECK(rBomYaml->status == 200);
+    CHECK(rBomYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rBomYaml->body == R"(yaml:{"sum":7})");
+
+    auto rBadYaml = tcp.Post("/add", "not_valid: [", "text/plain");
+    REQUIRE(rBadYaml);
+    CHECK(rBadYaml->status == 400);
+    CHECK(rBadYaml->get_header_value("Content-Type") == "application/yaml");
+    CHECK(rBadYaml->body.find("invalid_yaml") != std::string::npos);
+
+    // /openapi.json includes YAML note
+    auto oa = tcp.Get("/openapi.json");
+    REQUIRE(oa);
+    CHECK(oa->status == 200);
+    auto spec = slimr::parse_json<slimr::Json>(oa->body);
+    REQUIRE(spec.has_value());
+    CHECK((*spec)["info"]["description"].get<std::string>() ==
+          "Endpoints also accept and return application/yaml.");
+
+    srv.stop();
+}

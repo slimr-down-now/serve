@@ -223,4 +223,16 @@ TEST_CASE("[core] build_openapi_spec generates OpenAPI 3.1.0 with schemas, serve
     CHECK(prefixedSpec["paths"].contains("/tools/add"));
     CHECK(prefixedSpec["paths"].contains("/tools/ping"));
     CHECK_FALSE(prefixedSpec["paths"].contains("/add"));
+
+    // yamlEnabled appends media-type note to info.description (empty and non-empty)
+    slimr::ServeApp emptyYamlApp("empty-yaml", "1.0.0");
+    auto emptyYamlSpec = slimr::build_openapi_spec(emptyYamlApp, slimr::OpenApiOptions{.yamlEnabled = true});
+    CHECK(emptyYamlSpec["info"]["description"].get<std::string>() ==
+          "Endpoints also accept and return application/yaml.");
+    CHECK_FALSE(emptyYamlSpec["paths"].contains("/add"));
+
+    auto descYamlSpec = slimr::build_openapi_spec(app, slimr::OpenApiOptions{.yamlEnabled = true});
+    CHECK(descYamlSpec["info"]["description"].get<std::string>() ==
+          "Calculator tools\n\nEndpoints also accept and return application/yaml.");
+    CHECK_FALSE(descYamlSpec["paths"]["/add"]["post"]["requestBody"]["content"].contains("application/yaml"));
 }
