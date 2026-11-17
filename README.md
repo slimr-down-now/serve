@@ -82,23 +82,11 @@ CLI tool calls relay to a running server with `--remote unix:<path>` or `--remot
 ```bash
 just test            # Debug build (ASan + UBSan) and run tests
 just lint            # Check formatting and run clang-tidy
-just release patch   # Trigger release workflow and pull tag commit
 ```
 
 Extra test targets go in `CMakeLists.txt` (`add_executable` and `add_test`): unfiltered `just test` runs all via `ctest`, while `just test "<case>"` runs only `test_target`.
 
-## Develop against an unreleased lib
-
-vcpkg reads extra port dirs from `VCPKG_OVERLAY_PORTS`, and an overlay wins over the registry. Point it at a dir of symlinks, one per unreleased lib; manifests never change:
-
-```sh
-mkdir -p ~/.vcpkg/overlays/dev
-ln -s ~/dev/slimr/<name>/ports/slimr-<name> ~/.vcpkg/overlays/dev/slimr-<name>
-export VCPKG_OVERLAY_PORTS=~/.vcpkg/overlays/dev
-just test
-```
-
-Remove the symlink (or `unset VCPKG_OVERLAY_PORTS`) to build against the released lib again. Keep the export out of shell startup files. `just release` refuses to run while `VCPKG_OVERLAY_PORTS` is set.
+See [docs/contributing.md](docs/contributing.md) for local builds, testing, unreleased-library overlays, and releases.
 
 ## Environment Variables
 
